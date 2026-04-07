@@ -142,7 +142,8 @@ Of the 3 coding days, the split between GTM and architecture determines the beta
 |------|-----------|
 | Single node failure handling (don't kill the run) | 2-3 |
 | Proactive failure messaging in chat | 1-2 |
-| Task restart from chat ("retry" button) | 2-3 |
+| Task restart from chat ("retry" button) | 2 |
+| Channel Selection Cases (Hardcoded not auto) | 1 |
 | Recurring automations (chat → PlanSpec → APScheduler → execute) | 2-3 |
 | **Beta total** | **7-11** |
 
