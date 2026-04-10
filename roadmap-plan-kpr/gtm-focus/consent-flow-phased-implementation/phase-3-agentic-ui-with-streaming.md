@@ -273,8 +273,9 @@ Screen opens
 | Refinement support: optional `instruction` in request body. When present, build messages as a follow-up turn (system prompt + previous draft + owner's instruction) | 1.5 |
 | Cancel handling: detect client disconnect, abort LLM call cleanly | 1 |
 | Cancel endpoint `DELETE /consent-request/{id}/draft-stream` | 0.5 |
-| Unit tests (mock streaming + cancel + refinement) | 2 |
-| **Subtotal** | **9** |
+| New endpoint `GET /consent-request/{id}/transcript` — returns transcript segments up to `transcript_snapshot_seq` (for calls) or WhatsApp messages up to `created_at` (for WhatsApp). Called on demand when the owner expands the transcript section. | 1 |
+| Unit tests (mock streaming + cancel + refinement + transcript fetch) | 2 |
+| **Subtotal** | **10** |
 
 ### 3.2 — Backend: Analyzer Awareness Refinement
 *Dependencies: 3.1*
@@ -304,7 +305,7 @@ The Phase 1 analyzer already emits `data_sources`. Phase 3 ensures `missing_data
 | Task | Hours |
 |------|-------|
 | `ConsentRequestSummary.tsx` (channel badge, requester, structured prompt) | 1.5 |
-| `ConsentTranscriptSection.tsx` (collapsible, renders calls + WhatsApp differently) | 2 |
+| `ConsentTranscriptSection.tsx` (collapsible, fetches transcript on demand via `GET /consent-request/{id}/transcript` using the `transcript_id` + `transcript_snapshot_seq` from request_payload — no inline transcript data stored) | 2 |
 | Unit tests | 0.5 |
 | **Subtotal** | **4** |
 
@@ -372,7 +373,7 @@ The most substantial frontend phase. Builds the entire agentic interaction model
 
 | Sub-phase | Hours |
 |---|---|
-| 3.1 — Backend streaming draft endpoint | 9 |
+| 3.1 — Backend streaming draft endpoint + transcript fetch endpoint | 10 |
 | 3.2 — Backend analyzer awareness refinement | 2 |
 | 3.3 — Frontend source classification helpers | 1.5 |
 | 3.4 — Frontend header sub-components | 4 |
@@ -380,7 +381,7 @@ The most substantial frontend phase. Builds the entire agentic interaction model
 | 3.6 — Frontend integrate agentic screen | 6 |
 | 3.7 — Phase 3 E2E integration testing | 17 |
 | Buffer | 6 |
-| **Phase 3 Total** | **66 hours (~8 days)** |
+| **Phase 3 Total** | **67 hours (~8.5 days)** |
 
 ---
 

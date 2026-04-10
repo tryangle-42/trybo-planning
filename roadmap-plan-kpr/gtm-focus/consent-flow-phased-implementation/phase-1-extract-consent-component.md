@@ -39,7 +39,7 @@ Add the new columns and migrate existing data into the JSONB shape.
 
 | Task | Hours |
 |------|-------|
-| Write migration: add `channel`, `request_payload` JSONB, `whatsapp_conversation_id` columns. Backfill existing rows: `channel='inbound_call'`, `request_payload = jsonb_build_object(...)` from old `information_prompt` + `suggested_data_sources`. Drop the old columns. | 1.5 |
+| Write migration: add `channel`, `request_payload` JSONB, `whatsapp_conversation_id` columns. Backfill existing rows: `channel='inbound_call'`, `request_payload` built from old `information_prompt` + `suggested_data_sources` (with `conversation_context.transcript_id` left null for backfilled rows — they didn't store transcript references). Drop the old columns. | 1.5 |
 | Indexes: `idx_consent_requests_channel`, `idx_consent_requests_wa_conversation` | 0.5 |
 | RLS policy review | 0.5 |
 | Local supabase verification with existing rows | 0.5 |
@@ -54,7 +54,7 @@ Add the new columns and migrate existing data into the JSONB shape.
 |------|-------|
 | Refactor `InformationRequestProcessor` → `ConsentRequestProcessor` with new method `process_consent_request(channel, user_id, call_id?, task_id?, whatsapp_conversation_id?, request_payload, db)` | 2 |
 | Update `_create_consent_request` to write `channel` + `request_payload` JSONB instead of the old columns | 1 |
-| Existing `_handle_owner_info_request_intent` in `voice_service.py` builds the `request_payload` dict (summary, conversation_context with turns + data_sources + missing_data_sources) and calls `process_consent_request(channel="inbound_call", ...)` | 1 |
+| Existing `_handle_owner_info_request_intent` in `voice_service.py` builds the `request_payload` dict (summary, conversation_context with `transcript_id` + `transcript_snapshot_seq` + data_sources + missing_data_sources — no full transcript copy, just a reference) and calls `process_consent_request(channel="inbound_call", ...)` | 1 |
 | Update `ConsentRequestStore` (`consent_request_store.py`) to read/write `request_payload` JSONB | 1 |
 | Update FCM payload builder (`firebase_service.send_information_request_notification`): extract summary/channel/requester from `request_payload`, replace hardcoded `"channel": "call"` with the dynamic value | 1 |
 | Unit tests | 1 |

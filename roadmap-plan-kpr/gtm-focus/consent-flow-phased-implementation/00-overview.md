@@ -84,14 +84,15 @@ whatsapp_conversation_id:   (nullable) FK to whatsapp_conversations
   "requester_number": "+1234567890",
   "contact_id": "uuid-or-null",
   "conversation_context": {
-    "turns": [{"role": "caller", "text": "..."}, ...],
+    "transcript_id": "uuid-of-existing-transcript",
+    "transcript_snapshot_seq": 12,
     "data_sources": ["device_calendar", "device_contact"],
     "missing_data_sources": ["device_calendar"]
   }
 }
 ```
 
-`conversation_context` bundles the transcript snapshot, the data sources needed, and the missing data sources into a single object — they all come from the same analyzer pass.
+`conversation_context` bundles the analyzer output and a **reference** to the conversation transcript (not a copy). The transcript already lives in `transcript_segments` (for calls) or `whatsapp_messages` (for WhatsApp) — storing it again here would be redundant. The `transcript_id` + `transcript_snapshot_seq` let the UI fetch segments on demand (up to the point the consent request was created), keeping the `request_payload` JSONB small.
 
 ### 3. Why the Schema Split?
 
@@ -181,8 +182,8 @@ Each triggers a separate consent request with its own DB record, notification, a
 |---|---|---|
 | Phase 1 — Extract reusable consent component | ~18 | ~2.5 |
 | Phase 2 — Multi-channel support | ~20 | ~2.5 |
-| Phase 3 — Agentic UI with streaming | ~66 | ~8 |
-| **Grand total** | **~104 hours** | **~13 working days** |
+| Phase 3 — Agentic UI with streaming | ~67 | ~8.5 |
+| **Grand total** | **~105 hours** | **~13 working days** |
 
 Each phase ships independently. The user can pause between phases without breaking anything.
 
