@@ -31,10 +31,14 @@ See: [phase-1-extract-consent-component.md](./phase-1-extract-consent-component.
 
 See: [phase-2-multi-channel-support.md](./phase-2-multi-channel-support.md)
 
-### Phase 3 — Agentic UI with Token Streaming
-**Goal**: Replace the existing consent screens with a true agentic experience. Token-by-token streaming, an agent activity panel with step rows, "Ask agent" conversational refinement, and inline permission grant flows.
+### Phase 3 — Agentic Consent Agent (Pydantic AI)
+**Goal**: Give the consent-request component true agentic intelligence. Phase 3 adds a backend agent — implemented using **Pydantic AI** — that plans, calls on-device tools, observes results, and drafts a response token-by-token. Token-by-token streaming, an agent activity panel driven by real tool calls, "Ask agent" conversational refinement that can re-query data on correction, and inline permission grant flows. The agent is drafting-only: every tool call and every reply is in service of producing a response the owner can send.
 
-**Why this phase last**: This is the largest single chunk of work. Phases 1 and 2 give us a stable, multi-channel consent system to build the new UI on top of. None of the previous phases need to be undone — they're upgraded in place.
+**Why this phase last**: This is the largest single chunk of work and the only phase that introduces backend orchestration. Phases 1 and 2 give us a stable, multi-channel consent system to build the agent on top of. None of the previous phases need to be undone — they're upgraded in place.
+
+**Why Pydantic AI**: It ships a first-class primitive (`ExternalToolset` + `DeferredToolRequests`) for our exact architecture — tools declared on the backend but executed on the mobile device via a pause-resume pattern. Provider-agnostic, Pydantic-native (fits our stack), production-proven.
+
+**Architecture**: 8 layers — wire/transport, agent orchestration (Pydantic AI), tool declarations, device-bridge executors, ephemeral state, scope constraint (drafting-only prompt), UI projection, surface integration. See the phased doc for the layer map.
 
 See: [phase-3-agentic-ui-with-streaming.md](./phase-3-agentic-ui-with-streaming.md)
 
@@ -176,16 +180,28 @@ Each triggers a separate consent request with its own DB record, notification, a
 
 ---
 
+### Phase 4 — Shift Response Drafting to Main Application Agent
+**Goal**: Move the response-drafting intelligence from the consent agent (Pydantic AI, ephemeral) to the main application agent (LangGraph orchestrator, persistent). The consent screen keeps its Phase 3 chat UI but receives drafts from the main agent instead of running its own LLM loop. `draft_consent_response` becomes a registered skill in the main agent's 70+ skill registry.
+
+**Why this phase last**: It requires both the consent agent (Phase 3) as a working fallback and the main agent's execution intelligence (M7) to be stable. Phase 4 is an optimization — the product works without it, but quality and extensibility improve when drafting has access to the main agent's full context, memory layers, and server-side data sources.
+
+**Key changes**: `draft_consent_response` skill in `seed_registry.py`, draft delivery via Supabase Realtime, refinement instructions routed to the main agent's conversation, Data Source Registry extended with server-side executors. Phase 3's Pydantic AI consent agent stays as fallback.
+
+See: [phase-4-main-agent-drafting.md](./phase-4-main-agent-drafting.md)
+
+---
+
 ## Total Effort Across All Phases
 
 | Phase | Hours | Days (8h/day) |
 |---|---|---|
 | Phase 1 — Extract reusable consent component | ~18 | ~2.5 |
 | Phase 2 — Multi-channel support | ~20 | ~2.5 |
-| Phase 3 — Agentic UI with streaming | ~67 | ~8.5 |
-| **Grand total** | **~105 hours** | **~13 working days** |
+| Phase 3 — Agentic consent agent + Data Source Registry | ~90 | ~11 |
+| Phase 4 — Shift drafting to main agent | ~26 | ~3.5 |
+| **Grand total** | **~154 hours** | **~19.5 working days** |
 
-Each phase ships independently. The user can pause between phases without breaking anything.
+Each phase ships independently. Phases 1–3 are the core product; Phase 4 is an optimization that unifies the drafting path with the main agent.
 
 ---
 
@@ -194,4 +210,5 @@ Each phase ships independently. The user can pause between phases without breaki
 - [00-overview.md](./00-overview.md) — this file
 - [phase-1-extract-consent-component.md](./phase-1-extract-consent-component.md) — Phase 1 detailed plan
 - [phase-2-multi-channel-support.md](./phase-2-multi-channel-support.md) — Phase 2 detailed plan
-- [phase-3-agentic-ui-with-streaming.md](./phase-3-agentic-ui-with-streaming.md) — Phase 3 detailed plan
+- [phase-3-agentic-ui-with-streaming.md](./phase-3-agentic-ui-with-streaming.md) — Phase 3 detailed plan (includes Data Source Registry)
+- [phase-4-main-agent-drafting.md](./phase-4-main-agent-drafting.md) — Phase 4 detailed plan
