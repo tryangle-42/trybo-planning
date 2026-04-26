@@ -13,14 +13,17 @@ This is not an implementation plan. This document describes:
 
 ## 1. The Core Question: Who Prepares What?
 
-### Decision: The Calling Channel Agent Prepares Everything
+### Decision: The Channel Agent Triggers, the Consent Component Prepares
 
-When any channel's intelligence (inbound voice agent, outbound voice agent, WhatsApp agent) decides that a consent request is needed, **the channel agent does the analysis work and hands the consent component a ready-to-use package**. The consent component does NOT re-read transcripts or re-analyze the conversation.
+When any channel's intelligence (inbound voice agent, outbound voice agent, WhatsApp agent) decides that a consent request is needed, **the channel agent only signals — it passes a transcript reference and the requester identity. The consent component runs the `InformationRetrievalAnalyzer` and assembles the `request_payload` itself.**
+
+> **Updated decision (supersedes earlier "channel agent prepares everything" model).** Earlier this design pushed payload assembly into each channel agent. That created duplicate prep logic in voice + WhatsApp and forced every future channel to re-implement the same analyzer call. The boundary now lives inside the consent component.
 
 **Why this decision:**
-- The channel agent already has the conversation in memory (session history, WhatsApp thread). Re-reading it would be wasteful duplication.
-- The channel agent's LLM call (`InformationRetrievalAnalyzer`) already determines the summary, data sources, and missing data sources. This analysis is context-dependent - it needs to understand the tone, intent, and flow of the conversation. The consent component is a delivery mechanism, not an intelligence layer.
-- The consent component should be a thin, channel-agnostic pipe: receive a structured request, create a DB record, send a notification, and later handle the owner's response. If we make it re-analyze, it becomes coupled to each channel's conversation format.
+- **Single source of analyzer logic.** The `InformationRetrievalAnalyzer` runs in exactly one place — the consent component. No duplicate prep code in voice / WhatsApp / future channels.
+- **Channel agents stay thin.** Adding a new channel (e.g., email, SMS) means writing a trigger + a transcript loader, not re-implementing the analyzer call.
+- **Consent component owns "what does the owner approve".** Cleaner ownership: if the payload shape evolves, only the consent component changes — channel agents are untouched.
+- **Trade-off accepted:** The consent component now reads the transcript through a channel-aware loader (call segments vs. WhatsApp messages). Adds ~1 LLM call worth of latency between trigger and FCM notification, since the analyzer call moves out of the channel agent's existing flow. Most sensitive on inbound calls; measure p50/p95.
 
 ### What the Channel Agent Provides to the Consent Component
 
@@ -35,34 +38,41 @@ task_id:                    (nullable) FK to bot_tasks table
 whatsapp_conversation_id:   (nullable) FK to whatsapp_conversations table
 ```
 
-**2. The request payload (stored as a single JSONB column - opaque blob, written once, read as a whole):**
-```json
-{
-  "summary":                      "John is asking for your schedule this Thursday",
-  "information_retrieval_prompt":  "Retrieve calendar events for Thursday...",
-  "requester_name":               "John Smith",
-  "requester_number":             "+1234567890",
-  "contact_id":                   "uuid-or-null",
-  "conversation_context": {
-    "transcript_id":              "uuid-of-existing-transcript",
-    "data_sources":               ["device_calendar", "device_contact"],
-    "missing_data_sources":       ["device_calendar"]
-  }
-}
+**2. A trigger context — NOT a pre-built payload.** The channel agent passes only the minimum the consent component needs to do its own preparation:
+
+```python
+ConsentRequestProcessor.process_consent_request(
+    channel,
+    user_id,
+    call_id | task_id | whatsapp_conversation_id,
+    transcript_ref={...},      # channel-specific shape, see below
+    requester_info={
+        "name": "John Smith",
+        "number": "+1234567890",
+        "contact_id": "uuid-or-null",
+    },
+)
 ```
 
-`conversation_context` bundles the analysis output from the channel agent: which data sources are needed, which are missing, and a **reference** to the conversation transcript (not a copy of it). The transcript already lives in `transcript_segments` (for calls) or `whatsapp_messages` (for WhatsApp) — storing it again inside `request_payload` would be redundant storage.
+**`transcript_ref` shape per channel** — different channels store conversations differently, so the reference is channel-specific:
 
-- `transcript_id` — points to the existing transcript record in the `transcripts` table. The UI fetches all segments on demand when the owner expands the transcript section (collapsed by default). No snapshot cutoff is applied — the full transcript is shown including any hold messages, which provides additional context for the owner. For WhatsApp, messages are fetched from `whatsapp_messages` by `conversation_id`.
+| Channel | `transcript_ref` shape | What the consent component loads |
+|---|---|---|
+| `inbound_call` / `outbound_call` | `{"transcript_id": "uuid", "transcript_snapshot_seq": 12}` (outbound uses the same shape as inbound — outbound must persist its conversation as a transcript record by trigger time, mirroring inbound) | Segments from `transcript_segments` for that transcript up to the snapshot seq |
+| `whatsapp` | `{"last_whatsapp_message_id": "uuid"}` (the top-level `whatsapp_conversation_id` column already identifies the thread) | Messages from `whatsapp_messages` for that `whatsapp_conversation_id` up to and including the last message id |
+
+**Why a per-channel shape (not a single `transcript_id`)**: a WhatsApp conversation is a many-row thread in `whatsapp_messages`, not a single transcript row. Forcing `transcript_id` onto WhatsApp means either passing a fake/null reference or losing the conversation context on the consent screen. The cutoff (snapshot_seq for calls, message id for WhatsApp) freezes the view to "what the conversation looked like when consent was triggered" so new messages arriving later don't leak into the UI's transcript view.
+
+**The `request_payload` is then assembled by the consent component** (not the channel agent) — see Section 2.
 
 ### Why This Split?
 
 The consent_requests table follows a clear principle:
 
 - **Separate columns** for things Postgres needs to enforce or query: FKs (call_id, task_id, whatsapp_conversation_id with referential integrity), channel discriminator (indexed, used in dispatch), lifecycle state (status, timestamps - queried and updated independently)
-- **Single JSONB (`request_payload`)** for the opaque request data the channel agent assembles and the UI consumes as a whole. This blob is written once at creation, never queried against (you never search "find all requests where missing_data_sources contains X"), and always read in full when the UI opens.
+- **Single JSONB (`request_payload`)** for the opaque request data the consent component assembles and the UI consumes as a whole. This blob is written once at creation, never queried against (you never search "find all requests where summary contains X"), and always read in full when the UI opens.
 
-This makes the consent component a true pass-through: the channel agent builds one JSON blob, the component stores it as-is, the notification carries it, the UI unpacks it. Nobody in between inspects or transforms the payload's internal structure.
+The channel agent only signals; the consent component builds the JSON blob and stores it. The notification carries it; the UI unpacks it. Nobody after creation inspects or transforms the payload's internal structure.
 
 **The resulting table shape:**
 ```
@@ -75,7 +85,7 @@ consent_requests:
   whatsapp_conversation_id    uuid FK -> whatsapp_conversations (nullable)
   channel                     text CHECK (IN 'inbound_call','outbound_call','whatsapp')
 
-  -- The request payload (single JSONB, opaque)
+  -- The request payload (single JSONB, assembled by the consent component)
   request_payload             jsonb
 
   -- Lifecycle state (separate columns - queried, indexed, updated independently)
@@ -88,45 +98,119 @@ consent_requests:
   updated_at                  timestamptz
 ```
 
-Note: The existing `information_prompt`, `suggested_data_sources`, and any future context fields all live inside `request_payload`. The `conversation_context` object within the payload holds the transcript, data sources, and missing data sources together as one analysis output.
+**The `request_payload` JSONB shape** (assembled by the consent component, not the channel agent):
 
-### What the Consent Component Does NOT Do
+```json
+{
+  "summary":                      "John is asking for your schedule this Thursday",
+  "information_retrieval_prompt":  "Retrieve calendar events for Thursday...",
+  "requester_name":               "John Smith",
+  "requester_number":             "+1234567890",
+  "contact_id":                   "uuid-or-null",
+  "conversation_context": {
+    // call channels only
+    "transcript_id":              "uuid-of-existing-transcript",
+    "transcript_snapshot_seq":    12,
+    // whatsapp channel only
+    "last_whatsapp_message_id":   "uuid-of-cutoff-message"
+  }
+}
+```
 
-- Does NOT read or analyze the transcript/conversation
-- Does NOT determine which data sources are needed
-- Does NOT generate the summary
-- Does NOT decide whether a consent request should be triggered (that's the channel agent's job)
+**No `data_sources` / `missing_data_sources` in the payload** — the response drafting agent (Section 4) decides at runtime which sources to call based on the `summary` + `information_retrieval_prompt` and its knowledge of the Data Source Registry. Pre-classifying upfront duplicated intelligence the agent already has, and the frontend never read those fields anyway. They are dropped.
 
-The consent component is a **stateless processor**: it takes the package, persists it, sends a notification, and later routes the owner's response back to the correct channel.
+### What the Consent Component DOES (and DOES NOT) Do
+
+**The consent component DOES:**
+- Run the analyzer on the conversation referenced by the channel intelligence
+- Assemble the `request_payload` JSONB
+- Persist the row, send the owner-facing notification, return the request id
+- Run the agentic drafting loop on demand
+- **Render the conversation context on demand** — given a consent request's channel-specific reference (transcript id + seq for calls, whatsapp_conversation_id + last_message_id for WhatsApp), return the conversation in a render-ready shape when the owner opens the transcript dropdown. The consent component owns this loader; the consent screen calls into it lazily on expand.
+- Collect the owner's response and route it back to the originating channel
+
+**The consent component does NOT:**
+- Decide whether a consent request should be triggered (that's the channel intelligence's job — only it knows when in the conversation a consent is warranted)
+- Pre-classify data sources up front (the response drafting agent decides at runtime which tools to call)
+- Fetch data from the owner's device (the UI's tool executors do that on the agent's behalf)
+- Speak to the caller or WhatsApp counterpart, ever — every requester-facing message belongs to the channel intelligence
+
+### Responsibility Split (Locked)
+
+The boundary between channel intelligence and consent component is fixed:
+
+| Responsibility | Owner |
+|---|---|
+| All caller- or counterpart-facing messages and audio (on-hold messages, stalls, failure fallbacks, the final delivered response wording for that channel) | Channel intelligence (voice / WhatsApp / future channels) |
+| Build the consent request — load the referenced conversation, run the analyzer, assemble the payload | Consent component |
+| Send the consent request to the owner (notification + screen) | Consent component |
+| Collect the owner's response | Consent component |
+| Route the collected response back to the originating channel | Consent component |
+| Take the routed response and deliver it through the channel's transport | Channel intelligence |
+
+The consent component's surface is **owner-facing only**. Anything the requester or counterpart hears or reads is the channel intelligence's job, end to end.
 
 ---
 
 ## 2. How the Consent Request Component Processes the Request
 
-The Consent Request Component receives the package and does exactly three things:
+The Consent Request Component receives the trigger and does four things:
 
-### Step 1: Persist to Database
+### Step 1: Prepare the Payload
+
+A `ConsentRequestPreparer` service inside the consent component:
+- Loads the conversation through a channel-aware loader using `transcript_ref`:
+  - `inbound_call` / `outbound_call` → fetch segments from `transcript_segments` for `transcript_id` up to `transcript_snapshot_seq`
+  - `whatsapp` → fetch messages from `whatsapp_messages` for `whatsapp_conversation_id` up to and including `last_whatsapp_message_id`
+- Calls `InformationRetrievalAnalyzer.analyze_information_request(...)` to produce `summary` + `information_retrieval_prompt`
+- Assembles the `request_payload` JSONB (summary, prompt, requester info, conversation_context with transcript reference)
+
+The analyzer no longer outputs `data_sources` / `missing_data_sources` — those are dropped from the payload. The response drafting agent decides at runtime which sources to call.
+
+### Step 2: Persist to Database
 
 Create a `consent_requests` row:
 - Relational columns: `channel`, `user_id`, `call_id`, `task_id`, `whatsapp_conversation_id`
-- `request_payload`: the entire JSONB blob from the channel agent (summary, data sources, missing sources, conversation context, requester identity - all in one field)
+- `request_payload`: the JSONB assembled in Step 1
 - `status: "pending"`
 
 This record is the single source of truth for the consent request lifecycle.
 
-### Step 2: Send Push Notification (FCM)
+### Step 3: Send Push Notification (FCM)
 
 Send a push notification to the owner's device. The FCM payload is a lightweight projection of `request_payload` plus the `request_id`:
-- `request_id` (so the UI can fetch the full record - including `conversation_context` with turns, data_sources, missing_data_sources - from DB)
+- `request_id` (so the UI can fetch the full record from DB)
 - `channel` (so the UI knows what kind of request this is)
 - `summary` (extracted from request_payload, for the notification text)
 - `requester_name` / `requester_number` (extracted from request_payload, for display)
 
-The notification is channel-agnostic. The FCM payload carries enough for the notification banner. When the UI opens, it fetches the full `request_payload` from DB using `request_id` to get the complete `conversation_context` (transcript, data sources, missing sources).
+The notification is channel-agnostic. The FCM payload carries enough for the notification banner. When the UI opens, it fetches the full `request_payload` from DB using `request_id` to get the `conversation_context` (transcript reference for rendering the prior conversation in context).
 
-### Step 3: Return the Request ID
+### Step 4: Return the Trigger Outcome
 
-Return the `consent_request_id` to the calling channel agent, so the agent can track it in its session (e.g., `active_consent_request_id` in the call session).
+The trigger is a round trip, not fire-and-forget. The consent component returns one of two outcomes to the channel intelligence:
+
+- **Success — consent created and notified**. The consent row was created and the owner notification was sent. The result includes the `consent_request_id` so the channel intelligence can track it in session state.
+- **Failure**. The consent component could not complete preparation or notification. A single flat "failed" verdict — no failure category. The channel intelligence applies the same fallback regardless of which step failed.
+
+**The analyzer does not gate consent.** Its job is purely to ASSEMBLE the consent request payload (summary + retrieval prompt) from the transcript. The decision that consent is needed was already made by the channel intelligence when it chose to trigger; the consent component does not second-guess that decision. There is no "no consent needed" outcome — that path does not exist. This avoids a redundant LLM call (analyzer deciding + voice intelligence regenerating) and keeps the consent component's intelligence narrow: build the payload, never gate.
+
+**Two-stage caller-facing messaging — no silence on the caller side.**
+
+The channel intelligence does not wait silently while the consent component works. It speaks to the requester twice:
+
+- **Stage 1 — fired the moment the trigger is sent (parallel with the consent component's work)**: an immediate filler such as *"I'm asking the owner about that"*. Channel intelligence owns the wording; the purpose is to break the silence during the consent component's round trip.
+- **Stage 2 — fired after the consent component returns its outcome**:
+  - On **success**: *"I've sent the request — putting you on hold while we wait for the response"*. The on-hold state begins here, not at Stage 1.
+  - On **failure**: *"I'm not able to answer that right now"* or similar fallback the channel intelligence already knows.
+
+There is no caller-side waiting period: Stage 1 covers the consent component's preparation time; Stage 2 reflects the actual outcome.
+
+The consent component never speaks to the caller / WhatsApp counterpart directly. Both Stage 1 and Stage 2 are owned by the channel intelligence. The consent component only prepares, persists, notifies, and reports back.
+
+**Hard rule: the analyzer figures things out from the full transcript, not from any summary.** The consent component loads the conversation through the channel-aware loader and hands the full transcript content to the analyzer. The analyzer must never receive a pre-computed summary as its input — its verdict on "is consent needed" and its summary output both depend on having the actual conversation in front of it.
+
+**Hard rule: no internal retries on the trigger path.** The consent component fails fast on the first error from any step (analyzer LLM call, DB write, FCM send, conversation load). The requester is on hold in silence during the entire trigger round trip, so internal retries — even one — extend that wait unacceptably. The channel intelligence's failure fallback is the only retry surface available; the consent component does not absorb flakiness.
 
 ---
 
@@ -146,22 +230,25 @@ A future "Third-Party Data Sources" component (Composio-based: Gmail, Outlook, S
 
 These three are the **only** sources the consent component will recognize. Any other source key the LLM suggests is treated as unknown.
 
-### 3.2 What the Channel Agent Sends
+### 3.2 No Pre-Classification — the Agent Decides at Runtime
 
-The channel agent's `InformationRetrievalAnalyzer` outputs source keys in `conversation_context.data_sources` and `conversation_context.missing_data_sources`. The consent screen classifies each one at open time:
+The `request_payload` carries NO pre-computed list of data sources. The response drafting agent (Pydantic AI consent agent) reads the Data Source Registry — which already declares the three device sources, their tools, and their permission keys — and decides autonomously which tools to call based on the `summary` and `information_retrieval_prompt`.
 
-| Classification | Meaning | How decided |
+Permission state is checked **inline by the tool executor** at the moment the agent calls a tool, not pre-classified up front:
+
+| Outcome | Cause | What the agent sees |
 |---|---|---|
-| **Available** | Device source AND permission already granted | `permissionService.checkPermission(source)` returns granted |
-| **Missing — connectable** | Device source AND permission denied but can be re-requested | `permissionService.checkPermission(source)` returns denied (and not permanently blocked) |
-| **Missing — blocked** | Device source AND permission permanently denied (user must go to Settings) | `permissionService` reports `NEVER_ASK_AGAIN` / `BLOCKED` state |
-| **Missing — unknown** | Source key is NOT one of the three known device sources | Source is not in `{device_calendar, device_contact, device_otp}` |
+| **Tool runs and returns data** | Permission already granted (or just granted via the in-flow OS dialog) | Normal tool result |
+| **Tool returns `permission_denied`** | Permission denied OR permanently blocked (`NEVER_ASK_AGAIN`/`BLOCKED`) | Agent drafts around the missing data, may surface a permission grant step row in the UI |
+| **Tool not called** | Agent decided this source isn't relevant given the request | No step row, no permission dialog |
+
+This collapses the old upfront classification table — the agent + tool executors do it lazily.
 
 ### 3.3 Why No Local Registry in This Component
 
-We do NOT define a separate registry. The set of three device source keys is small enough to inline as a constant, and `permissionService.ts` already owns the permission semantics for each one. Adding a registry would create drift.
+The Data Source Registry lives in its own module (`information_retrieval_generation/data_source_registry.py`) and is consumed by the consent agent — but the registry itself is consent-agnostic. Other agents (future main-agent in Phase 4, future automation skills) plug into the same registry.
 
-When the future Third-Party Data Sources component lands, it will introduce its own classification source (e.g., a connection-check API). At that point, the classification function in this component will be extended with one extra branch — the rest of the consent screen (activity panel, step rows, draft area, refinement loop) will not change.
+When the future Third-Party Data Sources component lands (Composio: Gmail, Outlook, Slack), it registers into the same registry. The consent agent picks up the new tools automatically — no changes to the consent screen, the SSE endpoints, the prompt's structure, or the channel handlers.
 
 ### 3.4 What Happens When a Source Is "Missing — Unknown"
 
@@ -182,32 +269,37 @@ If the LLM suggests `"bank_records"`, `"gmail"`, `"google_calendar"`, `"slack_me
 
 When the owner opens the consent screen (either from the push notification or from call logs), the UI has all the metadata it needs from the notification payload + DB record. Here's the rendering logic:
 
-### 4.1 Input Mode: Determined by Data Sources + Registry
+### 4.1 Input Mode: The Agent Decides
 
-The UI checks the `data_sources` array against the registry to decide what input to show:
+The UI does NOT branch on a `data_sources` array — that field is no longer in the payload. The agentic consent screen opens by default, and the agent itself decides what to do based on the `summary` + `information_retrieval_prompt`:
 
 ```
-IF data_sources contains ONLY "device_otp":
-  -> Show OTP-specific input (centered, number-pad, large font, auto-fill enabled)
-  -> Bypass the agentic flow entirely (Section 4.10)
-  -> User just enters the OTP code
+DEFAULT (every consent request):
+  -> Open the AGENTIC CONSENT SCREEN (Sections 4.2–4.8)
+  -> Agent reads summary + information_retrieval_prompt
+  -> Agent picks tools from the Data Source Registry, executes them on-device
+     via the tool bridge (permissions handled inline by the executors)
+  -> Agent streams a draft
+  -> Owner approves, refines, or declines
 
-ELSE IF data_sources contains ANY known device source
-        (device_calendar or device_contact):
-  -> Show the AGENTIC CONSENT SCREEN (Sections 4.2–4.8)
-  -> Agent classifies sources, requests missing permissions via step rows,
-     fetches data, streams a draft, and supports refinement via "Ask agent"
-  -> Owner can:
-       - Edit the draft directly
-       - Tap "Ask agent" with an instruction to refine the draft
-       - Tap "Send to caller" to deliver the draft as the final response
-       - Tap "Decline" to refuse
+SPECIAL CASE — OTP request:
+  -> The agent recognizes the request as an OTP fetch from the prompt
+  -> Instead of emitting a "drafting response" step, the agent emits an
+     "OTP collection" step in the same chat thread (no layout swap, no
+     separate screen variant)
+  -> The OTP collection step renders as a chat bubble with an OTP input
+     field (numeric keypad + native auto-fill — iOS OTP auto-fill on
+     iOS, Android SMS retrieval on Android) and an [Approve] button
+  -> Owner enters the OTP (typed or auto-filled) and taps [Approve]
+  -> The OTP value is delivered as the consent response — no draft
+     bubble in this path (see Section 4.10)
 
-ELSE IF every source is missing — unknown
-        (LLM asked for sources we don't support yet, e.g., gmail, slack):
-  -> Show blank draft area, "Ask agent" disabled
-  -> Owner writes the response manually (Section 4.11)
+SPECIAL CASE — agent has no usable tool for the request:
+  -> Agent calls no tools, drafts a "needs your input" message, or surfaces
+     a chat message asking the owner to write manually (Section 4.11)
 ```
+
+The OTP and "no usable source" paths used to be UI-side branches on the (now removed) `data_sources` array. They are now the agent's runtime decisions.
 
 ### 4.2 The Agentic Consent Screen
 
@@ -667,7 +759,11 @@ The critical simplification compared to the earlier design: the frontend no long
 
 ### 4.10 Special Case — OTP-Only
 
-When `data_sources == ["device_otp"]` (and nothing else), the agentic UI is bypassed entirely. There's no draft to generate — the owner just enters the OTP code.
+OTP requests stay inside the same agentic chat-thread layout — no separate screen variant, no layout swap. The agent itself recognizes the OTP intent from the request prompt and chooses a different STEP TYPE: instead of a "drafting response" step that produces a draft bubble, it emits an "OTP collection" step that produces an OTP input bubble.
+
+The OTP input bubble contains a numeric keypad input field with native auto-fill enabled (iOS OTP auto-fill on iOS, Android SMS retrieval on Android), plus an [Approve] button. The owner enters the OTP (typed or auto-filled) and taps [Approve]; the OTP value is delivered as the consent response. There is no draft bubble in this path — the OTP itself is the response.
+
+Selection of OTP vs draft is the agent's runtime decision, not a UI-side branch on any payload field. The data-source classification arrays that previously gated this are gone.
 
 Render: a centered numeric input with auto-fill enabled. Two buttons: "Send to caller" and "Decline". No agent activity panel, no streaming, no refinement.
 
@@ -713,9 +809,8 @@ Consent Component receives owner's decision
   |     -> Look up call_sid from call_id
   |     -> Check if call session is still live
   |     -> IF live:
-  |     |    -> Store response in session as "pending_consent_response"
-  |     |    -> The outbound agent picks it up on its next speech turn
-  |     |    -> Agent naturally incorporates it: "I have that information for you..."
+  |     |    -> Take the call off hold and proactively deliver the response
+  |     |    -> (Same model as inbound — no waiting for the caller to speak first)
   |     -> IF not live:
   |          -> Mark as expired
   |
@@ -730,11 +825,11 @@ Consent Component receives owner's decision
 
 | Behavior | Inbound Call | Outbound Call | WhatsApp |
 |----------|-------------|---------------|----------|
-| **What happens on approve** | Unhold call + play/stream response to caller | Inject into session for next agent turn | Send WhatsApp message |
+| **What happens on approve** | Unhold call + play/stream response to caller | Unhold call + proactively deliver response (same model as inbound) | Send WhatsApp message |
 | **What happens on decline** | Unhold call + play decline message | Inject decline into session | Optionally send decline message |
 | **Can the session expire?** | Yes (caller hangs up) | Yes (call ends) | No (WhatsApp is async) |
-| **Response delivery mechanism** | TwiML / duplex stream / LiveKit stream | Session flag pickup | WhatsApp API `send_outbound_text` |
-| **Timing pressure** | High (caller on hold) | Medium (agent stalling) | Low (async) |
+| **Response delivery mechanism** | TwiML / duplex stream / LiveKit stream | Same as inbound — TwiML / duplex stream / LiveKit stream (proactive on approve) | WhatsApp API `send_outbound_text` |
+| **Timing pressure** | High (caller on hold) | High (caller on hold — same as inbound) | Low (async) |
 
 ---
 
@@ -759,17 +854,28 @@ Consent Component receives owner's decision
 - Draft is generated using only device calendar data
 - The draft may be partial (the owner can see John's question is about Thursday, agent has the calendar data but not the email context), but the owner can supplement manually via "Ask agent" or by editing the draft directly
 
-### 6.3 Device Source Needs Permission (First Time or Previously Denied)
+### 6.3 Device Source Needs Permission — Inline Grant Flow with Resume
 
-**Scenario**: `data_sources: ["device_calendar"]`, owner previously denied calendar permission.
+**Scenario**: A tool the agent needs (e.g., calendar) returns `permission_denied` because the source's OS permission was not granted.
 
 **Behavior**:
-- `permissionService.checkPermission("calendar")` returns denied
-- Agent Activity panel emits: `? Need calendar access to read your schedule [Grant Permission]`
-- Owner taps `[Grant Permission]` → native OS permission dialog opens via `permissionService.requestPermission("calendar")`
-- If owner allows → row updates to `✓ Granted calendar access`, then continues with `⟳ Reading your device calendar` → `✓` → `⟳ Drafting response`
-- If owner denies once → row updates to `⊘ Skipped device calendar (no permission)`
-- If OS reports `NEVER_ASK_AGAIN` / `BLOCKED` (previously denied permanently): row updates to `? Calendar denied. Open Settings to enable it. [Open Settings]` — tapping deep-links to the app's settings page
+- The agent does NOT silently draft around the missing data. The drafting step is paused until the permission situation is resolved.
+- The step row in the chat thread shows the failure label and a source-specific button — e.g., *[Grant Permission — Calendar]*.
+- Tapping the button triggers the per-source / per-OS grant flow. The mechanics vary:
+  - **iOS, previously denied**: the OS does not allow the app to re-prompt natively. An app-level popup explains that the owner must go to device Settings and enable the permission manually for that source. When the owner returns to the app, the button has transformed to *[Resume]*.
+  - **iOS, first-time**: the standard OS permission dialog runs.
+  - **Android**: the standard OS dialog runs; if `BLOCKED` / `NEVER_ASK_AGAIN`, an app-level popup with a deep-link to settings replaces the dialog. Same *[Resume]* affordance applies on return.
+  - **Future sources** (e.g., Composio-backed third-parties): bring their own grant flows; the same *[Grant Permission — <source>] → [Resume]* affordance pattern is reused.
+- Tapping *[Resume]* re-checks the permission server-side / via permission service:
+  - If now granted → the failed tool is re-run and the agent resumes its flow toward drafting
+  - If still not granted → the button reverts to *[Grant Permission — <source>]* and the owner can try again or take the manual-response path (see 6.3a)
+- The agent never silently drafts around a permission denial — the owner is always offered the explicit chance to grant and get a better answer.
+
+### 6.3a Owner Refuses to Grant — Manual Response Escape Hatch
+
+**Scenario**: The owner does not want to grant the requested permission and wants to write the response themselves.
+
+**Behavior**: a *[Respond manually]* affordance is available in the agentic chat thread (it is universally available — for any reason, at any point in the consent flow). Tapping it opens an editor popup; the owner types or edits their response and confirms (Done). The submitted text becomes a draft bubble in the chat thread — visually and behaviorally identical to a "drafted response" step that the agent would have produced. The standard *[Approve & Send]* sits on this manual draft bubble, so the owner approves it the same way they would an agent draft. Manual response is the universal fallback whenever the agent cannot or should not produce the response itself.
 
 ### 6.4 Owner Grants a Permission Mid-Flow After Initial Draft
 
@@ -799,6 +905,59 @@ Consent Component receives owner's decision
 
 **Behavior**: Each triggers a separate consent request. Each gets its own DB record, its own notification, and its own response cycle. The consent component treats them independently. The channel agent tracks them via session state.
 
+### 6.5a Terminal-Status Handling (Two Checkpoints)
+
+**Scenario**: A consent request can reach a terminal status (`expired`, `canceled`, `approved`, `declined`, `delivered`) while the owner has not yet acted on it — most commonly because a live call ended before the owner finished reviewing the draft.
+
+**Behavior**: status is checked at two distinct moments, with different responses at each.
+
+**Checkpoint 1 — at notification tap (before the consent screen renders).**
+- If status is `pending`: navigate to the consent screen as designed.
+- If status is terminal: do **not** render the consent screen. The owner does not see it. (A lightweight system toast indicating "this request is no longer active" is acceptable, but no full screen.)
+
+The reasoning: if the request is dead by the time the owner taps the notification, there is nothing to act on — opening the screen would mislead them into thinking they could still respond.
+
+**Checkpoint 2 — at Approve & Send tap (after the screen has been open).**
+- The drafted-response API re-verifies status server-side on every submission. It does not trust the screen's last-known status.
+- If still `pending`: deliver normally through the channel-specific handler.
+- If now terminal: do not deliver. The API returns an "expired" outcome and the consent screen renders an **expired bubble inside the chat thread** (same style as agent / owner / draft bubbles), keeping the owner's drafted text visible while disabling action buttons.
+
+The two checkpoints cover two distinct timing windows: cold-open of a long-dead request (Checkpoint 1) and an in-flight expiration during active drafting (Checkpoint 2). One alone is insufficient.
+
+**Status lifecycle is owner-driven, not channel-driven.** Status stays `pending` until the owner acts. The channel intelligence does NOT proactively cancel pending consents when a call ends; there is no TTL sweep; no automatic expiration by elapsed time. The expired transition is computed lazily at Checkpoint 2 — when the owner taps Approve & Send and the consent component finds the originating channel is no longer live, status flips to `expired` at that moment and the screen shows the expired bubble. Implication: under this lazy model, Checkpoint 1 will rarely catch the "channel-ended" case (status is still pending), so cold-open of a stale consent will open the full agentic screen, the agent will draft, and Checkpoint 2 will catch it on Approve. Accepted trade-off: a little wasted compute on rare stale-tap cases, in exchange for no background timers or cancel hooks.
+
+### 6.6b Multi-Device Contention (Not a Concern)
+
+**Scenario**: Owner has the app installed on multiple devices and the consent notification fires on all of them.
+
+**Behavior**: This case does not arise. The app enforces single-device login per user — only one device can be active at a time. The consent screen inherits this guarantee, so there is never more than one open consent screen for the same owner. No claim/release lock or first-write/last-write resolution is needed in the consent flow itself.
+
+### 6.6c Outbound Calls Adopt the Inbound Hold Model
+
+**Decision**: outbound calls drop the existing soft-hold mechanism (the session-flag suppression + reactive injection on the next caller utterance) and adopt the **same hold semantics as inbound calls**:
+
+- **During the wait**: the call is placed on a literal hold at the transport layer. Outbound holds are **silent** — no hold music, no voice filler, no audio of any kind. (Inbound retains its existing hold media.)
+- **On owner approve**: the call is taken off hold and the response is **proactively delivered** by the agent — no waiting for the caller to speak first.
+- **The outbound flow is no longer a shape distinct from inbound** at the consent boundary. Both behave identically end-to-end during a consent cycle.
+
+**Why**: the previous reactive-pickup model created a delivery race — if the caller hung up after Approve but before speaking again, the response sat unconsumed and was never delivered, even though the system marked it as delivered. The unification eliminates the race entirely (delivery happens at approve time, not at next-utterance time) and reduces the consent flow to one mental model across all call channels.
+
+### 6.6a Hold-Period Discard (Calls and WhatsApp)
+
+**Scenario**: A consent request is pending. The conversation is on hold (call literally on hold, or WhatsApp conversation in suppressed-input state). The requester keeps speaking on the call, or the counterpart keeps sending WhatsApp messages.
+
+**Behavior**: every channel applies the same hard discard rule during hold.
+
+- **Requester input is dropped on the floor**. Audio / speech from a caller on hold is not transcribed into the transcript record. Inbound WhatsApp messages during the suppressed-input window are not persisted to the database, not added to the conversation history, and not stored in any memory layer. Hold-period input from the requester side is non-existent from the system's point of view.
+- **The agent does not respond during hold**. The channel intelligence stays silent on every channel. No filler, no acknowledgment, no clarifying question. The on-hold message that started the hold is the only message the requester receives until the consent resolves.
+- **The hold ends** the moment the consent request reaches a terminal status (approved + delivered, declined, expired, canceled). From the next requester input that arrives after the hold ends, normal behavior resumes — but anything from the hold window itself is gone, not retroactively persisted or considered.
+
+**Why this strict discard model**:
+- The on-hold state is a clean break: the requester's actions during the wait must not leak into anything afterward (transcript, draft, memory, future agent decisions)
+- The owner's consent decision is made against the conversation as it was when consent was triggered — adding hold-period content would change the context the owner approved against
+- Eliminates a class of bugs where the WhatsApp intelligence drafts a reply addressing things the counterpart said while waiting, or where the call agent's transcript later contains "are you there?" / "hello?" noise from the hold period
+- Symmetric across channels — calls and WhatsApp follow the same rule, so future channels inherit the same semantics
+
 ### 6.7 Owner Asks Agent to Refine the Draft (Tone / Style)
 
 **Scenario**: Initial draft says "I have a meeting at 3pm Thursday." Owner types "make it more apologetic" in the input box and taps "Ask agent".
@@ -814,6 +973,16 @@ Consent Component receives owner's decision
 - Step row updates to: `✓ Refined response`
 - Input box clears, ready for the next instruction
 - "Send to caller" remains enabled, owner can either send or ask for another refinement
+
+### 6.6d Owner Correction Is Always Authoritative
+
+**Scenario**: the owner refines with input that contradicts the original summary, the original retrieval prompt, or what the agent has just said. (E.g., original summary says "John is asking about Thursday", owner types "actually they meant Tuesday".)
+
+**Behavior**: the agent always defers to the owner's correction. It does not push back, does not negotiate, does not try to reconcile with the original framing, and does not re-run the analyzer. The correction is treated as the new ground truth for the rest of the screen session — the agent re-queries tools and re-drafts based on the corrected context.
+
+The original `request_payload.summary` and `information_retrieval_prompt` in the DB stay unchanged (per the freshness guarantee, no agent session state ever writes back to the consent row). The corrected context lives only in the in-memory conversation history of the current screen session and disappears when the screen unmounts.
+
+The principle: when the agent and the owner disagree, the owner wins. Always.
 
 ### 6.7b Owner Asks Agent to Refine Based on Correction (Re-Query)
 
@@ -859,16 +1028,18 @@ This is the behavior a text-rewrite refinement loop cannot produce and is the co
 
 ## 7. Summary: The Consent Component's Contract
 
-The Consent Request Component is a **channel-agnostic message broker** between channel agents and the device owner:
+The Consent Request Component is a **channel-agnostic, owner-facing intermediary** between channel intelligences and the device owner:
 
-**Input contract (from any channel):**
-- Structured package with: channel, identity, pre-analyzed summary, data sources, missing sources, conversation snapshot
-- The channel agent does ALL the intelligence work before calling the component
+**Input contract (from any channel intelligence):**
+- A trigger, not a pre-built payload. The channel intelligence passes: channel, the relational identifiers (user, call/task/whatsapp_conversation), a reference to the conversation (channel-specific shape — call transcript record + snapshot, or WhatsApp conversation + last-message-id cutoff), and the requester identity.
+- The channel intelligence does NOT run the analyzer or assemble the payload — that is the consent component's job.
 
 **Processing:**
-- Persist to DB
-- Send FCM notification with full metadata
-- Return request ID
+- Load the referenced conversation through a channel-aware loader
+- Run the analyzer to produce summary + retrieval prompt; assemble the payload (no data-source classification arrays)
+- Persist the row
+- Send the owner-facing notification
+- Return the trigger outcome (success with request id, or failure with reason) to the channel intelligence as a synchronous round trip
 - Run a Pydantic AI agent on demand via SSE (`/consent-request/{id}/agent-turn`) — the agent calls on-device tools through a deferred-tool side-channel POST (`/tool-result`) and streams the final draft back token-by-token
 
 **Output contract (to the UI):**

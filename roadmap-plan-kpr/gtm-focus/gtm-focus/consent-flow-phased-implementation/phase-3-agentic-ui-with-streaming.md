@@ -68,6 +68,210 @@ app/services/information_retrieval/
 - **All-unknown special case**: Agent loop still runs; should bypass and show blank input
 - **iOS + Android on-device E2E verification** (3.7): Partial — tested on iOS, Android pending
 
+### Future Work (Deferred — Not in Scope for Phase 3 Refinements)
+
+- **Server-side agent loop cleanup on dropped SSE connection**: The agent loop runs on the backend while SSE streams to the consent screen. If the connection drops without an explicit cancel (app backgrounded, network glitch, force-close), the server-side loop's lifecycle is currently undefined — it may run into a void, hold in-memory state, or only get cleaned up by the existing per-turn timeout. Deliberately deferred from this cycle. Will be addressed when **agentic chat memory** is developed in a future cycle, where session lifecycle and server-side loop ownership become first-class design concerns. Implementation of the current Phase 3 refinements should not introduce special handling for this case.
+
+---
+
+## Architectural Refinements (Pending — to be applied on top of shipped Phase 3)
+
+Three flow-level changes that tighten the consent component's ownership boundary, simplify what the payload carries, and fix how the conversation context is referenced for WhatsApp. No user-visible behavior change.
+
+### Refinement 1 — The Consent Component Prepares Its Own Payload
+
+**Today's flow:**
+The channel intelligence (voice or WhatsApp) detects an information request, runs the analyzer on its own conversation history, assembles the full request payload, and hands the finished payload to the consent component. The consent component is a pass-through — it persists what it was given.
+
+**New flow:**
+The channel intelligence only *triggers* the consent component. It passes:
+- A reference to the conversation (so the consent component can load the relevant turns)
+- Who the requester is (name, number, optional contact link)
+
+The consent component then prepares the payload itself: it loads the referenced conversation, runs the analyzer, and assembles the `request_payload`. Persistence and notification remain unchanged.
+
+**Why:**
+- One source of analyzer logic instead of one per channel
+- Channel intelligences become thin triggers — adding a new channel only needs a trigger + a way to reference its conversation, not a re-implementation of the analyzer call
+- The consent component fully owns "what does the owner approve" — when the payload shape evolves, only the consent component changes
+
+**Trade-off:**
+The notification fires later than today, because the analyzer now runs inside the consent component instead of inline in the channel intelligence's existing flow. This matters most for inbound calls, where the owner is expecting the alert during the live conversation.
+
+### Refinement 2 — Drop the Data-Source Lists From the Payload
+
+**Today's flow:**
+The analyzer outputs two arrays — the data sources it thinks are relevant and the data sources it thinks are missing — and they are persisted inside the payload's conversation context. The response drafting agent and the UI both have access to them, but in practice neither uses them: the agent makes its own decisions from the registry, and the UI doesn't read these arrays at all.
+
+**New flow:**
+The analyzer no longer produces these arrays. The payload no longer carries them. The response drafting agent decides at runtime which sources to query, based on the summary, the retrieval prompt, and its knowledge of the Data Source Registry. Permission outcomes are observed inline when a tool runs, not pre-classified.
+
+**Why:**
+- Removes dead fields nobody reads
+- Stops duplicating intelligence the agent already has
+- Lets the agent freely re-decide on each turn (e.g., a refinement might call a different source than the original draft) without being constrained by an upfront classification
+
+### Refinement 3 — Conversation Reference Is Channel-Specific
+
+**Today's flow:**
+The payload's `conversation_context` carries a single `transcript_id` field. This works for calls (one transcript record per call) but not for WhatsApp (a conversation is many separate message records). The WhatsApp path either passes a null/fake reference or loses the conversation context on the consent screen.
+
+**New flow:**
+The conversation reference shape depends on the channel:
+
+| Channel | What's referenced | Cutoff |
+|---|---|---|
+| Inbound call | The call transcript record | Snapshot sequence number — segments up to this point |
+| Outbound call | The call transcript record (same shape as inbound) | Snapshot sequence number — segments up to this point |
+| WhatsApp | The WhatsApp conversation thread (already identified by a top-level relational column) | The id of the last message that existed when consent was triggered |
+
+**Precondition for outbound calls (decided)**: outbound calls must persist their conversation as a transcript record (with sequenced segments) by the time consent is triggered — same way inbound calls do. If today's outbound flow keeps conversation only as in-memory session history, that persistence step is a prerequisite to applying Refinement 1 on the outbound channel.
+
+The cutoff exists so the consent screen renders a **frozen view** of the conversation as it was at trigger time. Without the cutoff, messages arriving on the WhatsApp side after the consent was created would leak into the conversation context the owner sees.
+
+**Why:**
+- Honest representation of how each channel stores conversations (call = one record + segments; WhatsApp = many message records)
+- Removes the fake/null transcript reference WhatsApp consents currently carry
+- Gives the consent screen an unambiguous cutoff so the conversation view doesn't drift while the owner is reading it
+
+### Verification (Flow-Level)
+
+1. ✅ A new consent request can be created without the channel intelligence ever calling the analyzer
+2. ✅ The consent component, given only a conversation reference and the requester info, produces the same quality of summary + retrieval prompt as the channel agent did before
+3. ✅ Persisted consent requests no longer carry data-source classification arrays inside the payload
+4. ✅ A WhatsApp consent request renders the WhatsApp thread up to its trigger-time cutoff, even if newer messages have arrived since
+5. ✅ A call consent request renders the call transcript up to its snapshot point, exactly as before
+6. ✅ The response drafting agent still produces sensible drafts using only the summary, the retrieval prompt, and the registry — no quality regression
+7. ✅ All three channel flows (inbound call, outbound call, WhatsApp) still ship end-to-end
+
+(Implementation guardrails for Refinements 1–5 are consolidated in the section below, after Refinement 5.)
+
+### Refinement 4 — Trigger Round Trip and Channel "On Hold" State
+
+The two open flow gaps above are answered together because they describe one mechanism.
+
+**The trigger is a round trip, not a fire-and-forget.**
+
+The channel intelligence triggers the consent component and **waits for the outcome**. The consent component does its preparation (load the full conversation transcript, run the analyzer to ASSEMBLE the payload, persist the row, send the FCM notification) and returns one of two results to the channel intelligence:
+
+- **Success — consent created and notified**. The consent row was created and the owner notification was sent. The result includes the request id so the channel intelligence can track it in its session state.
+- **Failure**. The consent component could not complete preparation or notification (DB error, FCM error, analyzer error, conversation load error, etc.). The outcome is a single flat "failed" verdict with no category — the channel intelligence falls back the same way regardless of which step failed.
+
+**The analyzer does not gate consent.** Its job is purely to ASSEMBLE the consent request payload (summary + retrieval prompt) from the transcript. It does not have a "no consent needed" verdict. The decision that consent is needed was already made by the channel intelligence when it chose to trigger; the consent component does not second-guess that decision. There is no third "no consent needed" outcome — that path does not exist.
+
+This avoids a redundant LLM call (analyzer deciding + voice intelligence re-generating its own reply) and keeps the consent component's intelligence narrow: build the payload, never gate.
+
+**Two-stage caller-facing messaging — eliminates the silence.**
+
+The channel intelligence does not wait silently for the consent component's outcome. It speaks to the requester twice:
+
+- **Stage 1 — fired the moment the trigger is sent (parallel with the consent component's work)**: an immediate filler along the lines of *"I'm asking the owner about that"*. Wording is owned by the channel intelligence; the goal is to break the silence so the requester is never sitting in dead air while the consent component prepares the request.
+- **Stage 2 — fired after the consent component's outcome arrives**:
+  - On **success**: a follow-up such as *"I've sent the request — putting you on hold while we wait for the response"*. Stage 2 is the moment the conversation actually transitions to the on-hold state.
+  - On **failure**: a fallback such as *"I'm not able to answer that right now"*. No on-hold state.
+
+This two-stage pattern means there is no caller-side waiting period — Stage 1 fills the time the consent component spends preparing, and Stage 2 reflects the real outcome.
+
+The consent component never speaks to the caller / WhatsApp counterpart directly. Both Stage 1 and Stage 2 are channel-intelligence responsibilities. The consent component only prepares, persists, notifies, and reports back.
+
+**Why on-hold state is gated on the success-with-consent outcome (Stage 2, not Stage 1)**: an actual hold (caller cannot interact with the agent until owner responds) requires that a real consent request exists and a real notification has gone out. Stage 1 is a conversational filler, not the hold itself. The hold begins when Stage 2 confirms it.
+
+**Responsibility split (locked):**
+
+| Responsibility | Owner |
+|---|---|
+| All caller-facing or counterpart-facing messages and audio (on-hold messages, stall replies, failure fallbacks, the final delivered response wording for that channel) | Channel intelligence (voice / WhatsApp / future channels) |
+| Build the consent request (load conversation, run analyzer, assemble payload) | Consent component |
+| Send the consent request to the owner (notification) | Consent component |
+| Collect the owner's response | Consent component |
+| Route the collected response back to the originating channel | Consent component |
+| Take the routed response and deliver it through the channel's transport | Channel intelligence |
+
+The consent component's surface is owner-facing only (notification + the consent screen). Anything the requester or counterpart hears or reads is the channel intelligence's job, end to end.
+
+**The conversation goes "on hold" the moment a consent request is pending — for every channel.**
+
+For calls this is already the case (the call is literally placed on hold). For WhatsApp, the same semantics now apply at the conversation level:
+
+- After the channel intelligence sends the on-hold message ("we are working on it, please hold on") in response to the triggering message, the WhatsApp conversation enters a **suppressed-input state**.
+- Any further messages from the WhatsApp counterpart while the consent request is pending are **dropped on the floor — not persisted to the database, not added to the conversation history, not stored in any memory layer, not surfaced anywhere.** The WhatsApp intelligence stays silent and the inbound is discarded entirely.
+- The suppressed-input state ends when the consent request reaches a terminal status — the owner approves and the response is delivered, the owner declines, or the request expires / is canceled.
+- Once the state ends, normal auto-reply behavior resumes for the next inbound message **that arrives after the state ended**. The discarded suppressed messages are gone — they are not retroactively persisted or considered.
+
+**Symmetric rule for call channels.** The same hold-period discard applies to live calls. While a call is on hold pending owner consent, any audio / speech from the caller during the hold is **not transcribed into the transcript record, not stored in the DB, and not held in any memory layer**. Hold-period input from the requester side — across every channel — is non-existent from the system's point of view.
+
+**Outbound calls adopt the inbound hold model — no more soft suppression.** Today, outbound calls use a soft-hold mechanism: a session flag suppresses the agent's speech turns and the owner's response is picked up reactively when the caller next utters something. This is being replaced with the inbound model:
+
+- **Literal hold during the wait**: when an outbound consent is triggered and the round-trip succeeds, the call is placed on a literal hold at the transport layer. The hold is **silent** — no hold music, no periodic voice filler, no audio of any kind. The caller hears silence until consent resolves. (Inbound calls keep their existing hold media; only outbound is silent.)
+- **Proactive delivery on approve**: when the owner approves, the consent component routes the response back through the same path inbound uses — the call is taken off hold and the response is delivered (spoken out) immediately, without waiting for the caller to speak first.
+- **Reactive pickup is removed**: the previous outbound-only soft-hold flag and the reactive injection-on-next-turn model are deprecated. Outbound and inbound consent behavior become the same shape end-to-end.
+
+This unification eliminates the outbound-specific delivery race (caller hangs up before next utterance, response sits unconsumed) by removing the reactive pickup entirely. Delivery now happens at approve time, not at next-utterance time.
+
+**No agent response during hold, on any channel.** The channel intelligence does not respond to anything the requester says or sends during the hold period — no acknowledgment, no clarifying question, no filler. WhatsApp stays silent on the conversation; the call agent generates no speech. The only message the requester gets during hold is the on-hold message that started the hold; everything after that is deliberate silence until the consent resolves and the owner's response (or a fallback) is delivered.
+
+**Why this WhatsApp behavior:**
+- Mirrors how calls already behave (caller is on hold, can't have a parallel conversation with the agent until the consent resolves)
+- Prevents the WhatsApp intelligence from drafting replies based on a partial picture while the owner is still reviewing the request
+- Keeps the WhatsApp counterpart's view consistent with what the owner is being asked to approve (otherwise the agent could say something contradicting the owner's pending decision)
+
+### Refinement 5 — Terminal-Status Handling (Two Checkpoints)
+
+The consent screen and the response-delivery path must both check status — at two different moments — and respond differently when the request is no longer actionable.
+
+**Checkpoint 1 — at notification tap (before the screen renders)**
+
+When the owner taps the FCM notification, status is checked **before navigating to the consent screen**.
+
+- **If status is `pending`**: navigate to the consent screen as designed. Agent loop starts, transcript context loads, action buttons are live.
+- **If status is terminal** (`expired`, `canceled`, `approved`, `declined`, `delivered`): the owner is **not shown the consent screen at all**. The notification handler short-circuits — no screen render, no agent loop, no transcript fetch. (A lightweight signal such as a system toast may indicate "this request is no longer active", but that is a UI affordance, not a full screen.)
+
+The intent is: if the request is already dead by the time the owner taps, there is nothing for them to act on, so the screen should not appear and waste their attention.
+
+**Checkpoint 2 — at Approve & Send tap (after the screen has been open)**
+
+The owner can have the consent screen open while the request is `pending`, then have it expire mid-review (clearest example: the live call ends while they're refining the draft). Before the consent component delivers the drafted response to the channel, it **re-verifies the request is still in `pending` status server-side**.
+
+The drafted-response API performs this check on every submission. It does not trust the screen's last-known status.
+
+- **If still pending**: deliver the response normally through the channel-specific handler.
+- **If now terminal**: do NOT deliver. The API returns an "expired" outcome to the screen, and the screen renders an **expired bubble inside the existing chat thread** (same visual style as agent / owner / draft bubbles) telling the owner the request has expired. The owner's drafted text stays visible so they can see what they tried to send; action buttons disable.
+
+**Why two checkpoints, not one:**
+- Checkpoint 1 protects the cold-open case — the owner taps the notification on a request whose status has already flipped to terminal (e.g., the owner declined earlier on a different notification surface, or any future path that explicitly cancels). Showing the screen at all would mislead them into thinking they can still act.
+- Checkpoint 2 protects the warm-edit case — the owner has the screen open and is actively drafting when the channel ends. The recheck prevents delivering a response into a dead conversation, and the bubble closes the loop honestly so the owner knows their draft was ready but never sent.
+
+**Status lifecycle is owner-driven, not channel-driven.**
+
+Status stays `pending` until the owner acts. There is no proactive cancellation by the channel intelligence when a call ends, no TTL sweep, no automatic expiration by elapsed time. A consent request can sit in `pending` indefinitely if the owner never touches it.
+
+The expired transition is computed lazily at Checkpoint 2: when the owner taps Approve & Send, the consent component checks whether the originating channel is still live. If it isn't, the request flips to `expired` at that moment and the screen shows the expired bubble. That is the only path by which "the channel has ended" causes a status change.
+
+Implication: under this lazy model, Checkpoint 1 will rarely fire for the "channel-ended" case — because status will still be `pending` when the owner taps the notification. The cold-open of a stale consent therefore opens the full agentic screen, the agent drafts, the owner refines and hits Approve — and Checkpoint 2 catches it. Acceptable trade-off: a little wasted drafting compute on rare stale-tap cases, in exchange for not introducing background timers or cancel hooks.
+
+### Implementation Guardrails (to prevent the obvious wrong turns)
+
+- **Boundary direction**: the consent component depends on the analyzer module, never the reverse. The analyzer must remain consent-unaware so other components (e.g., the future main agent in Phase 4) can use it.
+- **WhatsApp cutoff is a message id, not a timestamp**: timestamps in a chat thread can collide and have lower precision; an explicit message id matches a single row unambiguously.
+- **No DB schema migration is required**: the dropped data-source arrays and the new WhatsApp cutoff field both live inside the existing JSONB payload column. New rows have the new shape. Do not write a destructive migration.
+- **No backward-compatibility work for old rows**: this refactor is treated as a fresh implementation. Do not write legacy rendering paths, do not backfill old rows, do not run a one-time migration to rewrite old payloads. Existing pending consents from before the refactor are out of scope — implementation does not need to make them render correctly. Effort spent on backward-compat would be wasted.
+- **Analyzer output must shrink, not just the payload**: the data-source arrays should be removed at the analyzer's output too. Otherwise the analyzer keeps producing dead fields that simply never get persisted.
+- **Frontend dead-plumbing must be removed in the same scope as Refinement 2**: when the data-source arrays leave the payload, every frontend touchpoint that referenced them — the FCM notification handler, the Redux slice, the consent request interface, any source-classification helpers, any conditional rendering branching on these arrays — must be cleaned up in the same change set. No deprecation period, no follow-up cleanup pass. Leaving dead plumbing means future readers will assume those fields still mean something.
+- **The analyzer call belongs in the consent component, not in the screen layer**: the response drafting agent (which lives next to the screen) does its own runtime source decisions; it must not duplicate the analyzer's work. The analyzer runs once, at consent-creation time, on the server.
+- **Channel intelligence loses the analyzer dependency entirely**: after Refinement 1, voice and WhatsApp intelligences should not import or invoke the analyzer anywhere. If they still do, the boundary has been drawn wrong.
+- **Trigger round trip is synchronous from the channel's perspective**: the channel intelligence must know the trigger outcome before it sends any caller-facing message. Do not implement this as a fire-and-forget.
+- **The on-hold caller-facing message remains the channel intelligence's responsibility**: the consent component must not deliver caller / counterpart messages — it only reports the trigger outcome upstream.
+- **The analyzer reads the full transcript, not a pre-computed summary**: the analyzer's verdict on "is consent needed?" must be made against the actual conversation, not against any earlier shortened version. The consent component loads the transcript via the channel-aware loader and hands the full content to the analyzer.
+- **The trigger has exactly two outcomes — success and failure**: there is no third "no consent needed" outcome. The analyzer assembles the payload; it does not decide whether consent is needed. If the channel intelligence triggered, a consent request is created (success) or it is not (failure). The on-hold message fires on success, the fallback fires on failure — no other branches exist.
+- **The analyzer assembles, it does not gate**: the analyzer's only job is to produce the summary and retrieval prompt from the transcript. It does not output a "needs_consent" boolean and it must not be wired up that way. The decision that consent is needed already happened upstream in the channel intelligence; revisiting it inside the consent component would mean two LLM passes for the same decision and would create a path where the channel says "I'm asking the owner" then has to backtrack.
+- **No internal retries on the trigger path**: the consent component must fail fast on the first error from any step (analyzer LLM call, DB write, FCM send, conversation load). Internal retries — even one — extend the trigger latency, and on a live call the requester is waiting in silence the whole time. The channel intelligence's failure fallback is the only retry surface; it is not the consent component's job to hide flakiness.
+- **WhatsApp suppressed-reply state is keyed off pending consent for the conversation**: the WhatsApp intelligence checks "is there a pending consent request for this `whatsapp_conversation_id`?" before deciding whether to auto-reply. The check must be on consent status, not on a separate flag, so the state always matches the actual lifecycle.
+- **Multi-device contention is not a concern**: the app already enforces single-device login (only one active device per user at a time). The consent flow inherits this guarantee — there can never be two consent screens open for the same owner on different devices, so no claim/release/lock mechanism is needed. The freshness guarantee remains correct as written.
+- **Owner correction is always authoritative**: when the owner refines with input that contradicts the original summary, the original retrieval prompt, or what the agent previously said, the agent must defer to the owner's correction without negotiation. It does not try to reconcile, does not re-run the analyzer, does not preserve the original framing. It treats the correction as the new ground truth for the rest of the screen session and re-queries tools / re-drafts as needed. The original `request_payload.summary` and `information_retrieval_prompt` in the DB stay unchanged (the freshness guarantee — agent session state never writes back to the consent row); the corrected context lives only in the in-memory conversation history of the current screen session.
+- **OTP path is a step type, not a layout swap**: when the agent recognizes an OTP fetch intent, it emits an "OTP collection" step inside the same chat thread (rendered as a chat bubble containing a numeric input with native auto-fill + Approve), in place of the usual "drafting response" step. There is no separate OTP screen, no layout variant, no payload flag. The decision is made at agent runtime from the request prompt. The OTP value submitted on Approve becomes the consent response — there is no draft bubble in this path.
+- **Conversation context is lazy-loaded, not eager**: the consent screen does NOT pre-fetch the transcript or WhatsApp thread on open. The transcript view is collapsed by default; the payload only carries a reference (transcript id + snapshot seq for calls, whatsapp_conversation_id + last_message_id for WhatsApp). The actual fetch happens only when the owner taps to expand the transcript section. Eager loading the conversation on every screen open is wasteful — most consents never need the transcript opened.
+- **Transcript rendering is a capability owned by the consent component**: the on-demand transcript fetch + render is part of the consent component's owner-facing surface, not a separate generic loader. Given the channel-specific reference inside the payload, the consent component returns the conversation in a render-ready shape (call segments for calls, WhatsApp messages for WhatsApp) when the owner opens the dropdown. This keeps the channel-aware loader logic inside the same component that prepared the payload — one place owns "how to read a consent request's conversation context."
+
 ---
 
 ## Goal
@@ -991,6 +1195,31 @@ The drafting step ("Drafting response") streams its output like any other step �
 
 **11. When intent is unclear, the agent asks the owner.**
 Rather than guessing, the agent can ask the owner to clarify what they want. This is preferable to silently making the wrong choice — whether that's altering outgoing content the owner didn't intend to change, or answering when the owner wanted a redraft. If asking isn't practical, default to ANSWER — safer to inform than to change what gets sent.
+
+**12. The first-turn draft is mandatory when data is sufficient.**
+On the first turn, the agent MUST produce a draft response if it has enough data from the available sources to do so. It does not pause to ask the owner for direction first, does not surface a "what do you want to say?" prompt — it just drafts. Drafting is the default first-turn outcome whenever the data supports it. (If data is insufficient, see Rule 11 — the agent asks the owner.)
+
+**13. Conversation history is append-only — the agent never rewrites its own past messages.**
+When the owner corrects something the agent said earlier, the contradicted prior agent message stays in the in-memory conversation history as-is. The history is not edited, struck through, or mutated. The LLM has full visibility into the entire conversation including its own past mistakes, and weights newer corrections over older statements when reasoning. Transparency wins over a "clean" rewritten history.
+
+**14. Owner correction is authoritative; on ambiguity between sources and owner, the agent asks.**
+When the owner provides input that contradicts what data sources returned (or what the agent previously said), the owner's correction wins by default — the agent re-queries with the corrected context and re-drafts. When the conflict is genuinely ambiguous (it's not clear whether the owner is correcting the data, or asking about a different scenario, or providing supplementary info), the agent does not silently pick a side — it surfaces a clarifying question to the owner via Mode B (ANSWER) and waits for the next turn. Interactive resolution is preferred over guessing.
+
+**15. The drafting step always emits on the first turn — placeholder when data is insufficient.**
+The "drafting response" step is mandatory on the first response routing, regardless of whether the agent has enough data. If the agent has enough data, it streams the actual draft tokens into the draft bubble (existing behavior). If the agent does NOT have enough data to draft, the draft bubble still renders on the first turn but shows a professional placeholder along the lines of *"I don't have enough information to draft a response — please reply with your own message below."* The placeholder informs the owner that manual input is needed; the owner then writes their response through the manual-response escape hatch (Rule 17). The draft bubble is never silently skipped on the first turn. (Exception: when the agent is paused waiting on a permission grant — see Rule 16 — the drafting step is delayed until the permission situation is resolved.)
+
+**16. Permission denial pauses drafting; the grant flow runs inline in the chat thread, with a Resume affordance.**
+When a tool returns `permission_denied`, the agent does NOT draft around the missing data on that turn. Instead:
+- The step row in the chat thread shows the failure label and a source-specific button — e.g., *[Grant Permission — Calendar]*.
+- The agent's drafting step is paused; the agent waits for the permission situation to resolve before continuing.
+- Tapping the button triggers the per-source / per-OS grant flow. The actual mechanics vary: on iOS, where a previously-denied OS permission cannot be re-prompted natively, an app-level popup explains that the owner needs to go to the device Settings and enable the permission manually. On Android, the standard OS dialog or settings deep-link applies. Future sources (e.g., Composio-backed third-parties) bring their own grant flows.
+- While the owner is away handling the grant, the button transforms to *[Resume]*.
+- On *[Resume]* tap, the consent screen re-checks the permission. If now granted, the failed tool is re-run and the agent resumes its flow (continues toward drafting). If still not granted, the button reverts to *[Grant Permission — <source>]* and the owner can try again or take the manual-response path (Rule 17).
+- The agent never silently drafts around a permission denial — the owner is always given the explicit chance to grant and get a better answer.
+
+**17. Manual response is always an available escape hatch.**
+The owner can elect to write the response themselves — for any reason, at any point in the consent flow (no data, refused permission, simply prefer to write it). A *[Respond manually]* affordance is available in the agentic chat thread. Tapping it opens an editor popup; the owner types or edits their response and confirms (e.g., a Done action). The submitted text becomes a draft bubble in the chat thread — treated visually and behaviorally as a "drafted response" step, even though the agent didn't produce it. The standard *[Approve & Send]* action sits on this manual draft bubble, so the owner approves it the same way they would approve an agent draft. Manual response is the universal fallback: it is what makes Rule 15's insufficient-data placeholder actionable, and what makes Rule 16's "owner refuses to grant" path resolvable.
+
 
 ### Change 1: Pass current draft text to the backend on refinement
 
