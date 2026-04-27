@@ -284,15 +284,21 @@ DEFAULT (every consent request):
 
 SPECIAL CASE — OTP request:
   -> The agent recognizes the request as an OTP fetch from the prompt
-  -> Instead of emitting a "drafting response" step, the agent emits an
-     "OTP collection" step in the same chat thread (no layout swap, no
-     separate screen variant)
-  -> The OTP collection step renders as a chat bubble with an OTP input
-     field (numeric keypad + native auto-fill — iOS OTP auto-fill on
-     iOS, Android SMS retrieval on Android) and an [Approve] button
-  -> Owner enters the OTP (typed or auto-filled) and taps [Approve]
-  -> The OTP value is delivered as the consent response — no draft
-     bubble in this path (see Section 4.10)
+  -> The agent calls a `request_otp` tool (same shape as device tools
+     like `get_calendar_events`, just with the value provided by the
+     owner instead of by a device API)
+  -> The frontend renders the tool call as a step row with an inline
+     input bubble (numeric keypad + native auto-fill: iOS oneTimeCode,
+     Android SMS retrieval) and a Done button
+  -> Owner enters the OTP (autofilled or manual) → taps Done → the
+     value POSTs back as the tool result → agent resumes
+  -> The agent then drafts a normal response embedding the OTP
+     (e.g., "Your OTP is XXXXXX") — this is the draft bubble
+  -> Owner approves the draft → response is delivered to the requester
+     through the normal channel-handler path
+  -> If the owner refuses to enter the OTP, the agent drafts a
+     "I can't provide this" response which the owner approves and sends
+     (see Section 4.10)
 
 SPECIAL CASE — agent has no usable tool for the request:
   -> Agent calls no tools, drafts a "needs your input" message, or surfaces
@@ -757,13 +763,23 @@ The critical simplification compared to the earlier design: the frontend no long
 - For WhatsApp: renders as message-style layout (inbound/outbound messages with timestamps)
 - Helps the owner understand the full context before deciding what to do
 
-### 4.10 Special Case — OTP-Only
+### 4.10 Special Case — OTP Request
 
-OTP requests stay inside the same agentic chat-thread layout — no separate screen variant, no layout swap. The agent itself recognizes the OTP intent from the request prompt and chooses a different STEP TYPE: instead of a "drafting response" step that produces a draft bubble, it emits an "OTP collection" step that produces an OTP input bubble.
+OTP requests stay inside the same agentic chat-thread layout — no separate screen variant. The agent recognizes the OTP intent from the request prompt and treats it as a **data-extraction step**, parallel to its existing device tools (`get_calendar_events`, `search_contacts`, `get_time`). The only difference is who supplies the value: the owner instead of a device API.
 
-The OTP input bubble contains a numeric keypad input field with native auto-fill enabled (iOS OTP auto-fill on iOS, Android SMS retrieval on Android), plus an [Approve] button. The owner enters the OTP (typed or auto-filled) and taps [Approve]; the OTP value is delivered as the consent response. There is no draft bubble in this path — the OTP itself is the response.
+**Flow:**
 
-Selection of OTP vs draft is the agent's runtime decision, not a UI-side branch on any payload field. The data-source classification arrays that previously gated this are gone.
+1. Agent calls a `request_otp` tool. The frontend renders the tool call as a step row with an inline OTP input bubble — numeric keypad + native auto-fill (iOS `oneTimeCode` auto-fill, Android SMS retrieval) + a Done button.
+2. Owner provides the OTP — autofilled from SMS by the OS, or typed manually — and taps Done.
+3. The OTP value POSTs back as the tool result via the existing deferred-tool bridge. The step row updates to show the captured digits so the owner can verify what was submitted.
+4. The agent resumes and drafts a natural response that embeds the OTP (e.g., *"Your OTP is XXXXXX"*). This is the standard drafting step that follows any data extraction.
+5. The owner approves the draft. The response is delivered to the requester through the channel-handler path — same as any other consent response.
+
+**If the owner refuses to enter the OTP** (dismisses the input, doesn't autofill, gives no value), the agent treats it as missing data and drafts a polite refusal (*"I can't provide this"* or similar). The owner approves that draft, and the refusal is delivered to the requester.
+
+**Persistence:** the OTP value lives only in the in-memory agent loop for the duration of the screen session — never in DB or logs. The freshness guarantee covers this. The final approved draft (containing the OTP wrapped in natural language) is stored as `delivered_response`, identical to every other consent response.
+
+Selection of the OTP path vs another data extraction path is the agent's runtime decision, not a UI-side branch on any payload field.
 
 Render: a centered numeric input with auto-fill enabled. Two buttons: "Send to caller" and "Decline". No agent activity panel, no streaming, no refinement.
 
