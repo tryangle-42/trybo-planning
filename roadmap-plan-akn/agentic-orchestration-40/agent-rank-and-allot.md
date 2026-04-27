@@ -1,9 +1,11 @@
 # AgentRank and AgentAllot — Long-Term Vision (Not Baseline)
 
 > Owner: AKN
-> Module mapping: M4 (Skill Ranking & Selection)
+> Module mapping: M4 (Skill Ranking & Selection) / L2 component **C4**
 > Current completion: M4 at ~5% (only hardcoded Perplexity→Tavily fallback exists)
 > Research basis: RouteLLM, AgentRank-UC, CoCoMaMa, SkillRouter, CLASSic framework
+
+> **Boundary note (2026-04-25):** C4 owns the *entire* multi-provider routing concern — composite scoring, fallback chains, exploration/A-B, sticky-session memory, cost-budget honoring, and the *fallback walk on failure*. The C2 Execution Tools doc (TB-706) had originally drafted a "C2.5 Multi-Provider Routing Substrate" that intended to split decision (M4) from dispatch (C2). That split has been **removed** — fallback decisions on runtime failure are themselves ranking decisions, so they belong here. **C2 now stops at "execute one chosen call, return one Receipt."** L2 (Execution Engine) runs the fallback loop: it asks C4 for a ranked chain, then calls C2 once per attempt, feeding each Receipt back to C4 via `record_outcome`. See `execution-tools.md` §4 revision note.
 
 ---
 
@@ -231,6 +233,28 @@ The ranker exposes 5 operations:
 | `get_provider_health(capability)` | Health status of all providers for a capability | Analytics / debug endpoints |
 
 **Integration with M5:** When the executor encounters a capability-level `skill_id` in the PlanSpec (e.g., `web.search`), it calls `ranker.select("web.search")`. The ranker returns a concrete provider (e.g., `perplexity.search`) plus a fallback chain. The executor uses the concrete provider for the adapter invocation.
+
+**Integration with C2 (Execution Tools):** C2 does not see the ranking, the chain, or the fallback walk. The flow is:
+
+```python
+# In L2 Execution Engine, per plan node:
+ranking = ranker.select(capability, context)           # C4
+for provider in [ranking.primary, *ranking.fallbacks]: # C4-owned chain
+    if provider.health == "disabled":                  # C4 filter
+        continue
+    receipt = adapter.run_skill(                       # C2 — one attempt
+        skill_name=provider.skill_id,
+        inputs=resolved_inputs,
+        context=task_context,
+    )
+    ranker.record_outcome(provider.skill_id, receipt)  # C4 telemetry sink
+    if receipt.success:
+        break
+    if receipt.error_category in {"CONSENT_DENIED", "AUTH"}:
+        break  # not a fallback case; surface to user
+```
+
+C2 stays "given X, do X." C4 stays "given a capability and context, here's the ranked chain — and learn from outcomes." The fallback loop itself runs in L2 because L2 is the only layer that holds both halves (the chain from C4 and the executor's per-node lifecycle).
 
 ---
 
