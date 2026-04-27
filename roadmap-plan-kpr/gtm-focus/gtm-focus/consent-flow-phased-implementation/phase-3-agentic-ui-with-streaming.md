@@ -202,7 +202,9 @@ For calls this is already the case (the call is literally placed on hold). For W
 
 **Outbound calls adopt the inbound hold model — no more soft suppression.** Today, outbound calls use a soft-hold mechanism: a session flag suppresses the agent's speech turns and the owner's response is picked up reactively when the caller next utters something. This is being replaced with the inbound model:
 
-- **Literal hold during the wait**: when an outbound consent is triggered and the round-trip succeeds, the call is placed on a literal hold at the transport layer. The hold is **silent** — no hold music, no periodic voice filler, no audio of any kind. The caller hears silence until consent resolves. (Inbound calls keep their existing hold media; only outbound is silent.)
+- **Literal hold during the wait — transport-specific**: when an outbound consent is triggered and the round-trip succeeds, the call is placed on a literal hold at the transport layer. The behavior depends on which transport the outbound call uses:
+  - **LiveKit-based outbound** → mirror inbound exactly: literal hold, hold music, full unhold-with-response on approve. The caller experience is identical to an inbound call placed on hold.
+  - **Knowlarity-based outbound** → silent hold is sufficient. The current session-flag-based soft-hold (no agent response, no transcription) is acceptable; no hold music or media manipulation needed at the transport layer.
 - **Proactive delivery on approve**: when the owner approves, the consent component routes the response back through the same path inbound uses — the call is taken off hold and the response is delivered (spoken out) immediately, without waiting for the caller to speak first.
 - **Reactive pickup is removed**: the previous outbound-only soft-hold flag and the reactive injection-on-next-turn model are deprecated. Outbound and inbound consent behavior become the same shape end-to-end.
 

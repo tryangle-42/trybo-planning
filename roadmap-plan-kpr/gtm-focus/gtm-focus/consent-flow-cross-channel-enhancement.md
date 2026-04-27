@@ -952,7 +952,9 @@ The two checkpoints cover two distinct timing windows: cold-open of a long-dead 
 
 **Decision**: outbound calls drop the existing soft-hold mechanism (the session-flag suppression + reactive injection on the next caller utterance) and adopt the **same hold semantics as inbound calls**:
 
-- **During the wait**: the call is placed on a literal hold at the transport layer. Outbound holds are **silent** — no hold music, no voice filler, no audio of any kind. (Inbound retains its existing hold media.)
+- **During the wait — transport-specific**: the call is placed on a literal hold at the transport layer. The behavior depends on which transport the outbound call uses:
+  - **LiveKit-based outbound** → mirror inbound exactly (literal hold + hold music + full unhold-with-response on approve)
+  - **Knowlarity-based outbound** → silent hold is sufficient (the current session-flag-based soft-hold suffices; no transport-level media manipulation needed)
 - **On owner approve**: the call is taken off hold and the response is **proactively delivered** by the agent — no waiting for the caller to speak first.
 - **The outbound flow is no longer a shape distinct from inbound** at the consent boundary. Both behave identically end-to-end during a consent cycle.
 
