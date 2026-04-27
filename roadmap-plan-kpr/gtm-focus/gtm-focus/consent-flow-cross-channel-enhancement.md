@@ -869,6 +869,10 @@ Consent Component receives owner's decision
 
 **Visual design parity**: the inline permission grant bubble matches the EditableDraftCard and OtpInputBubble visual language — green-bordered card, button row with `flex-1` outlined "Can't grant" on the LEFT and `flex-2` filled-green "Grant Permission — <Source>" / "Resume" on the RIGHT. Same `rounded-xl` corners, `font-semibold` labels, same color tokens. Across the consent flow, every human-intervention bubble looks and feels like the draft card.
 
+**Universal popup rule for owner inputs (with one exception).** Owner-input affordances in the consent agentic chat default to opening as a **modal popup** matching the existing draft Edit popup pattern (semi-transparent backdrop, centered card with primary border, `TextInput` with `autoFocus`, Done button). This applies to the "Respond manually" editor and any future text-input case.
+
+**OTP is an explicit exception:** the OTP input is rendered **inline inside the bubble** (visible TextInput with native auto-fill: iOS `oneTimeCode`, Android `sms-otp`). Reason: native OTP auto-fill needs the input focused immediately on bubble appearance to attach the OS suggestion bar / SMS Retriever — wrapping it in a tap-to-open popup adds a click before autofill can fire and degrades the OTP UX. The bubble shows: inline OTP TextInput + outlined "Can't provide" (left) + filled-green "Done" (right). Autofill drop-in auto-Done fires from the inline input.
+
 ### 6.3a Owner Refuses to Grant — Manual Response Escape Hatch
 
 **Scenario**: The owner does not want to grant the requested permission and wants to write the response themselves.
