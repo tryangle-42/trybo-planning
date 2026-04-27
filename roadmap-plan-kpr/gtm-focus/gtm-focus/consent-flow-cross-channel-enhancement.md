@@ -858,8 +858,14 @@ Consent Component receives owner's decision
   - **Future sources** (e.g., Composio-backed third-parties): bring their own grant flows; the same *[Grant Permission — <source>] → [Resume]* affordance pattern is reused.
 - Tapping *[Resume]* re-checks the permission server-side / via permission service:
   - If now granted → the failed tool is re-run and the agent resumes its flow toward drafting
-  - If still not granted → the button reverts to *[Grant Permission — <source>]* and the owner can try again or take the manual-response path (see 6.3a)
+  - If still not granted → **the bubble visually resets** — the right button must once again render as the enabled, filled-green *[Grant Permission — <source>]* (or *[Open Settings — <source>]* on iOS-blocked) so the owner can try again. It must NOT remain disabled / grey. A small inline note explains "Still not granted — try again, or tap Can't grant to respond manually." The owner can also take the manual-response path (see 6.3a).
 - The agent never silently drafts around a permission denial — the owner is always offered the explicit chance to grant and get a better answer.
+
+**SSE recovery on return-from-Settings.** When the owner leaves the app for Settings, the OS may suspend the network and kill the SSE connection that's carrying the agent's `/agent-turn` stream. On return, before the bubble's Resume action can usefully POST a tool result, the SSE connection must be re-established (the server-side agent loop dies with the SSE; there's no one listening for the result otherwise). Behavior:
+- The frontend hook tracks the active SSE connection state.
+- When the app transitions to `active` AND there is a pending human-intervention bubble (permission grant or OTP) AND the SSE connection is no longer alive → the hook automatically restarts the agent turn from scratch (re-uses the existing in-memory `conversation_history`). The agent re-calls the same tool, the bubble re-renders, the owner can now act and have the result posted successfully.
+- The transient "SSE connection failed" error state is cleared on auto-restart so the owner doesn't see a leftover red error from the suspended connection.
+- This restart is a UX recovery, not a state-machine concern: the agent loses its in-progress message_history within the current turn (which was lost when SSE died anyway), but the screen-session `conversation_history` (across-turn dialog) is intact.
 
 **Visual design parity**: the inline permission grant bubble matches the EditableDraftCard and OtpInputBubble visual language — green-bordered card, button row with `flex-1` outlined "Can't grant" on the LEFT and `flex-2` filled-green "Grant Permission — <Source>" / "Resume" on the RIGHT. Same `rounded-xl` corners, `font-semibold` labels, same color tokens. Across the consent flow, every human-intervention bubble looks and feels like the draft card.
 
