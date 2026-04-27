@@ -733,13 +733,22 @@ OTP requests stay inside the same agentic chat-thread layout — no separate scr
 
 **Flow:**
 
-1. Agent calls a `request_otp` tool. The frontend renders the tool call as a step row with an inline OTP input bubble — numeric keypad + native auto-fill (iOS `oneTimeCode` auto-fill, Android SMS retrieval) + a Done button.
-2. Owner provides the OTP — autofilled from SMS by the OS, or typed manually — and taps Done.
-3. The OTP value POSTs back as the tool result via the existing deferred-tool bridge. The step row updates to show the captured digits so the owner can verify what was submitted.
-4. The agent resumes and drafts a natural response that embeds the OTP (e.g., *"Your OTP is XXXXXX"*). This is the standard drafting step that follows any data extraction.
-5. The owner approves the draft. The response is delivered to the requester through the channel-handler path — same as any other consent response.
+1. Agent calls a `request_otp` tool. The frontend renders the tool call as a step row with an inline OTP input bubble — numeric keypad + native auto-fill (iOS `oneTimeCode` auto-fill, Android SMS retrieval) + a Done button + a Can't-provide button.
+2. **The agent loop is FROZEN at this step.** Token streaming stops. The agent does NOT proceed to drafting, does NOT time out, does NOT auto-fall-through. It waits indefinitely for the owner to take one of two explicit actions:
+   - **Done** — owner enters the OTP. The OTP value POSTs back as the tool result via the deferred-tool bridge. Two paths into Done:
+     - **Autofill path (auto-Done)**: when the OS supplies the full OTP via native auto-fill (iOS `oneTimeCode` suggestion tapped, Android SMS Retriever fires), the bubble treats the autofill action as the owner's explicit Done — the OTP is submitted immediately, no extra tap required. Picking the autofill suggestion is itself an explicit owner gesture.
+     - **Manual path (explicit Done tap)**: when the owner types the OTP digit-by-digit, the Done button must be tapped to submit. No auto-submit on character-by-character input.
+   - **Can't provide** — owner explicitly refuses. A refusal signal POSTs back as the tool result.
+3. Until one of those buttons is tapped, the agent stays paused at the OTP step. There is no time limit, no defensive timeout, no auto-draft.
+4. On Done: the step row updates to show the captured digits, the agent resumes and drafts a natural response embedding the OTP (e.g., *"Your OTP is XXXXXX"*). Owner approves and the response is delivered to the requester.
+5. On Can't provide: the agent resumes and drafts a polite refusal (*"I can't provide this"* or similar). Owner approves and the refusal is delivered.
 
-**If the owner refuses to enter the OTP** (dismisses the input, doesn't autofill, gives no value), the agent treats it as missing data and drafts a polite refusal (*"I can't provide this"* or similar). The owner approves that draft, and the refusal is delivered to the requester.
+**Hard rule (general principle): the agent loop waits indefinitely on ANY tool call until the frontend responds — there is no defensive per-turn timeout that could auto-fall-through to drafting.** This applies to:
+- Owner-supplied tools (`request_otp` and any future tools where the value comes from the owner via UI)
+- Permission-denied returns that surface an inline grant flow — the frontend holds the tool result while the owner is in Settings, and the agent must keep waiting
+- Any future tool whose execution path can require human intervention
+
+The agent never auto-assumes "permission denied" or "timeout" or "no value" on its own. It waits until the owner explicitly acts (Done / Can't provide / Grant Permission / Resume / etc.), at which point the frontend POSTs the actual tool result. If the owner closes the consent screen entirely, the SSE connection tears down and the agent loop is canceled through that path — not through a defensive timeout.
 
 **Persistence:** the OTP value lives only in the in-memory agent loop for the duration of the screen session — never in DB or logs. The freshness guarantee covers this. The final approved draft (containing the OTP wrapped in natural language) is stored as `delivered_response`, identical to every other consent response.
 
@@ -840,6 +849,7 @@ Consent Component receives owner's decision
 
 **Behavior**:
 - The agent does NOT silently draft around the missing data. The drafting step is paused until the permission situation is resolved.
+- **The agent loop is FROZEN at this step until the owner explicitly acts.** No token streaming. No auto-draft. No defensive timeout. The agent stays paused on the `permission_denied`-bearing tool call indefinitely until either Grant flow resolves successfully, or the owner taps the explicit refuse affordance ("Can't grant"). This is the same indefinite-wait rule that applies to the OTP step and to any future step requiring human intervention.
 - The step row in the chat thread shows the failure label and a source-specific button — e.g., *[Grant Permission — Calendar]*.
 - Tapping the button triggers the per-source / per-OS grant flow. The mechanics vary:
   - **iOS, previously denied**: the OS does not allow the app to re-prompt natively. An app-level popup explains that the owner must go to device Settings and enable the permission manually for that source. When the owner returns to the app, the button has transformed to *[Resume]*.
@@ -850,6 +860,8 @@ Consent Component receives owner's decision
   - If now granted → the failed tool is re-run and the agent resumes its flow toward drafting
   - If still not granted → the button reverts to *[Grant Permission — <source>]* and the owner can try again or take the manual-response path (see 6.3a)
 - The agent never silently drafts around a permission denial — the owner is always offered the explicit chance to grant and get a better answer.
+
+**Visual design parity**: the inline permission grant bubble matches the EditableDraftCard and OtpInputBubble visual language — green-bordered card, button row with `flex-1` outlined "Can't grant" on the LEFT and `flex-2` filled-green "Grant Permission — <Source>" / "Resume" on the RIGHT. Same `rounded-xl` corners, `font-semibold` labels, same color tokens. Across the consent flow, every human-intervention bubble looks and feels like the draft card.
 
 ### 6.3a Owner Refuses to Grant — Manual Response Escape Hatch
 
