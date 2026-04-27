@@ -78,25 +78,19 @@ app/services/information_retrieval/
 
 Three flow-level changes that tighten the consent component's ownership boundary, simplify what the payload carries, and fix how the conversation context is referenced for WhatsApp. No user-visible behavior change.
 
-### Refinement 1 — The Consent Component Prepares Its Own Payload
+### Refinement 1 — The Consent Component Prepares Its Own Payload  ❌ REVERTED (2026-04-27)
 
-**Today's flow:**
-The channel intelligence (voice or WhatsApp) detects an information request, runs the analyzer on its own conversation history, assembles the full request payload, and hands the finished payload to the consent component. The consent component is a pass-through — it persists what it was given.
+This refinement was implemented and then reverted after testing. The original "channel intelligence prepares the full payload (analyzer + assembly) and hands the finished package to the consent component" model is restored.
 
-**New flow:**
-The channel intelligence only *triggers* the consent component. It passes:
-- A reference to the conversation (so the consent component can load the relevant turns)
-- Who the requester is (name, number, optional contact link)
+**Why reverted:**
+- The channel intelligence already has the conversation in memory (session history, WhatsApp thread). Re-loading it inside the consent component was wasteful duplication.
+- Moving the analyzer call into the consent component added ~1 LLM-call worth of latency between trigger and FCM notification — most painful on inbound calls where the owner expects the alert during the live conversation.
+- The consent component is a thin, channel-agnostic pipe — keeping intelligence in each channel agent (where the conversation already lives) is cleaner than centralizing it.
 
-The consent component then prepares the payload itself: it loads the referenced conversation, runs the analyzer, and assembles the `request_payload`. Persistence and notification remain unchanged.
+**Restored model:**
+The channel intelligence (voice or WhatsApp) detects an information request, runs the analyzer on its own conversation history, assembles the full request payload, and hands the finished payload to the consent component. The consent component is a pass-through — it persists what it was given, sends the FCM notification, and returns the trigger outcome.
 
-**Why:**
-- One source of analyzer logic instead of one per channel
-- Channel intelligences become thin triggers — adding a new channel only needs a trigger + a way to reference its conversation, not a re-implementation of the analyzer call
-- The consent component fully owns "what does the owner approve" — when the payload shape evolves, only the consent component changes
-
-**Trade-off:**
-The notification fires later than today, because the analyzer now runs inside the consent component instead of inline in the channel intelligence's existing flow. This matters most for inbound calls, where the owner is expecting the alert during the live conversation.
+The other refinements in this document (2 — drop data-source arrays from the analyzer output, 3 — channel-specific transcript reference, 4 — round-trip + hold-period discard, 5 — terminal-status checkpoints, 6 — agent prompt rules + `request_otp` tool) are NOT affected by this revert and remain in force.
 
 ### Refinement 2 — Drop the Data-Source Lists From the Payload
 

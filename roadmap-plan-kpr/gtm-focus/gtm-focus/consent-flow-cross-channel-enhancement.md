@@ -13,17 +13,16 @@ This is not an implementation plan. This document describes:
 
 ## 1. The Core Question: Who Prepares What?
 
-### Decision: The Channel Agent Triggers, the Consent Component Prepares
+### Decision: The Calling Channel Agent Prepares Everything
 
-When any channel's intelligence (inbound voice agent, outbound voice agent, WhatsApp agent) decides that a consent request is needed, **the channel agent only signals — it passes a transcript reference and the requester identity. The consent component runs the `InformationRetrievalAnalyzer` and assembles the `request_payload` itself.**
+When any channel's intelligence (inbound voice agent, outbound voice agent, WhatsApp agent) decides that a consent request is needed, **the channel agent does the analysis work and hands the consent component a ready-to-use package**. The consent component does NOT re-read transcripts or re-analyze the conversation.
 
-> **Updated decision (supersedes earlier "channel agent prepares everything" model).** Earlier this design pushed payload assembly into each channel agent. That created duplicate prep logic in voice + WhatsApp and forced every future channel to re-implement the same analyzer call. The boundary now lives inside the consent component.
+> **Decision reverted (2026-04-27):** an earlier iteration of this design tried to move payload preparation INTO the consent component (the consent component would load the transcript + run the analyzer itself, given only a reference from the channel intelligence). That iteration was reverted after implementation testing — the channel agent already has the conversation in memory and the analyzer's output, so making the consent component re-read everything was wasteful duplication. The original "channel agent prepares everything" model is restored.
 
 **Why this decision:**
-- **Single source of analyzer logic.** The `InformationRetrievalAnalyzer` runs in exactly one place — the consent component. No duplicate prep code in voice / WhatsApp / future channels.
-- **Channel agents stay thin.** Adding a new channel (e.g., email, SMS) means writing a trigger + a transcript loader, not re-implementing the analyzer call.
-- **Consent component owns "what does the owner approve".** Cleaner ownership: if the payload shape evolves, only the consent component changes — channel agents are untouched.
-- **Trade-off accepted:** The consent component now reads the transcript through a channel-aware loader (call segments vs. WhatsApp messages). Adds ~1 LLM call worth of latency between trigger and FCM notification, since the analyzer call moves out of the channel agent's existing flow. Most sensitive on inbound calls; measure p50/p95.
+- The channel agent already has the conversation in memory (session history, WhatsApp thread). Re-reading it would be wasteful duplication.
+- The channel agent's LLM call (`InformationRetrievalAnalyzer`) already determines the summary, data sources, and missing data sources. This analysis is context-dependent — it needs to understand the tone, intent, and flow of the conversation. The consent component is a delivery mechanism, not an intelligence layer.
+- The consent component should be a thin, channel-agnostic pipe: receive a structured request, create a DB record, send a notification, and later handle the owner's response. If we make it re-analyze, it becomes coupled to each channel's conversation format.
 
 ### What the Channel Agent Provides to the Consent Component
 
@@ -38,68 +37,7 @@ task_id:                    (nullable) FK to bot_tasks table
 whatsapp_conversation_id:   (nullable) FK to whatsapp_conversations table
 ```
 
-**2. A trigger context — NOT a pre-built payload.** The channel agent passes only the minimum the consent component needs to do its own preparation:
-
-```python
-ConsentRequestProcessor.process_consent_request(
-    channel,
-    user_id,
-    call_id | task_id | whatsapp_conversation_id,
-    transcript_ref={...},      # channel-specific shape, see below
-    requester_info={
-        "name": "John Smith",
-        "number": "+1234567890",
-        "contact_id": "uuid-or-null",
-    },
-)
-```
-
-**`transcript_ref` shape per channel** — different channels store conversations differently, so the reference is channel-specific:
-
-| Channel | `transcript_ref` shape | What the consent component loads |
-|---|---|---|
-| `inbound_call` / `outbound_call` | `{"transcript_id": "uuid", "transcript_snapshot_seq": 12}` (outbound uses the same shape as inbound — outbound must persist its conversation as a transcript record by trigger time, mirroring inbound) | Segments from `transcript_segments` for that transcript up to the snapshot seq |
-| `whatsapp` | `{"last_whatsapp_message_id": "uuid"}` (the top-level `whatsapp_conversation_id` column already identifies the thread) | Messages from `whatsapp_messages` for that `whatsapp_conversation_id` up to and including the last message id |
-
-**Why a per-channel shape (not a single `transcript_id`)**: a WhatsApp conversation is a many-row thread in `whatsapp_messages`, not a single transcript row. Forcing `transcript_id` onto WhatsApp means either passing a fake/null reference or losing the conversation context on the consent screen. The cutoff (snapshot_seq for calls, message id for WhatsApp) freezes the view to "what the conversation looked like when consent was triggered" so new messages arriving later don't leak into the UI's transcript view.
-
-**The `request_payload` is then assembled by the consent component** (not the channel agent) — see Section 2.
-
-### Why This Split?
-
-The consent_requests table follows a clear principle:
-
-- **Separate columns** for things Postgres needs to enforce or query: FKs (call_id, task_id, whatsapp_conversation_id with referential integrity), channel discriminator (indexed, used in dispatch), lifecycle state (status, timestamps - queried and updated independently)
-- **Single JSONB (`request_payload`)** for the opaque request data the consent component assembles and the UI consumes as a whole. This blob is written once at creation, never queried against (you never search "find all requests where summary contains X"), and always read in full when the UI opens.
-
-The channel agent only signals; the consent component builds the JSON blob and stores it. The notification carries it; the UI unpacks it. Nobody after creation inspects or transforms the payload's internal structure.
-
-**The resulting table shape:**
-```
-consent_requests:
-  -- Identity & relationships (separate columns)
-  id                          uuid PK
-  user_id                     uuid FK -> user_profiles
-  call_id                     uuid FK -> calls (nullable)
-  task_id                     uuid FK -> bot_tasks (nullable)
-  whatsapp_conversation_id    uuid FK -> whatsapp_conversations (nullable)
-  channel                     text CHECK (IN 'inbound_call','outbound_call','whatsapp')
-
-  -- The request payload (single JSONB, assembled by the consent component)
-  request_payload             jsonb
-
-  -- Lifecycle state (separate columns - queried, indexed, updated independently)
-  status                      text (pending|approved|declined|expired|canceled|delivered)
-  expires_at                  timestamptz
-  responded_at                timestamptz
-  delivered_response          text
-  delivered_at                timestamptz
-  created_at                  timestamptz
-  updated_at                  timestamptz
-```
-
-**The `request_payload` JSONB shape** (assembled by the consent component, not the channel agent):
-
+**2. The request payload (built by the channel agent, stored as a single JSONB column - opaque blob, written once, read as a whole):**
 ```json
 {
   "summary":                      "John is asking for your schedule this Thursday",
@@ -117,14 +55,53 @@ consent_requests:
 }
 ```
 
-**No `data_sources` / `missing_data_sources` in the payload** — the response drafting agent (Section 4) decides at runtime which sources to call based on the `summary` + `information_retrieval_prompt` and its knowledge of the Data Source Registry. Pre-classifying upfront duplicated intelligence the agent already has, and the frontend never read those fields anyway. They are dropped.
+`conversation_context` carries a **reference** to the conversation transcript (not a copy). The transcript already lives in `transcript_segments` (for calls) or `whatsapp_messages` (for WhatsApp) — storing it again inside `request_payload` would be redundant.
+
+- `transcript_id` + `transcript_snapshot_seq` (call channels) — the transcript record + segment cutoff at trigger time, so the consent screen's transcript view is frozen to what the conversation looked like when consent was triggered.
+- `last_whatsapp_message_id` (WhatsApp) — message-id cutoff for the WhatsApp thread, same purpose.
+- **No `data_sources` / `missing_data_sources`** — the response drafting agent (Section 4) decides at runtime which sources to call based on the `summary` + `information_retrieval_prompt` and its knowledge of the Data Source Registry. (Per Refinement 2, kept intact through this revert.)
+
+### Why This Split?
+
+The consent_requests table follows a clear principle:
+
+- **Separate columns** for things Postgres needs to enforce or query: FKs (call_id, task_id, whatsapp_conversation_id with referential integrity), channel discriminator (indexed, used in dispatch), lifecycle state (status, timestamps - queried and updated independently)
+- **Single JSONB (`request_payload`)** for the opaque request data the channel agent assembles and the UI consumes as a whole. This blob is written once at creation, never queried against, and always read in full when the UI opens.
+
+This makes the consent component a true pass-through: the channel agent builds one JSON blob, the component stores it as-is, the notification carries it, the UI unpacks it. Nobody in between inspects or transforms the payload's internal structure.
+
+**The resulting table shape:**
+```
+consent_requests:
+  -- Identity & relationships (separate columns)
+  id                          uuid PK
+  user_id                     uuid FK -> user_profiles
+  call_id                     uuid FK -> calls (nullable)
+  task_id                     uuid FK -> bot_tasks (nullable)
+  whatsapp_conversation_id    uuid FK -> whatsapp_conversations (nullable)
+  channel                     text CHECK (IN 'inbound_call','outbound_call','whatsapp')
+
+  -- The request payload (single JSONB, opaque)
+  request_payload             jsonb
+
+  -- Lifecycle state (separate columns - queried, indexed, updated independently)
+  status                      text (pending|approved|declined|expired|canceled|delivered)
+  expires_at                  timestamptz
+  responded_at                timestamptz
+  delivered_response          text
+  delivered_at                timestamptz
+  created_at                  timestamptz
+  updated_at                  timestamptz
+```
+
+Note: All payload fields (summary, information_retrieval_prompt, requester identity, conversation_context) live inside the `request_payload` JSONB built by the channel agent.
 
 ### What the Consent Component DOES (and DOES NOT) Do
 
 **The consent component DOES:**
-- Run the analyzer on the conversation referenced by the channel intelligence
-- Assemble the `request_payload` JSONB
-- Persist the row, send the owner-facing notification, return the request id
+- Persist the row using the payload built by the channel agent
+- Send the owner-facing notification
+- Return the request id to the channel agent
 - Run the agentic drafting loop on demand
 - **Render the conversation context on demand** — given a consent request's channel-specific reference (transcript id + seq for calls, whatsapp_conversation_id + last_message_id for WhatsApp), return the conversation in a render-ready shape when the owner opens the transcript dropdown. The consent component owns this loader; the consent screen calls into it lazily on expand.
 - Collect the owner's response and route it back to the originating channel
@@ -142,7 +119,7 @@ The boundary between channel intelligence and consent component is fixed:
 | Responsibility | Owner |
 |---|---|
 | All caller- or counterpart-facing messages and audio (on-hold messages, stalls, failure fallbacks, the final delivered response wording for that channel) | Channel intelligence (voice / WhatsApp / future channels) |
-| Build the consent request — load the referenced conversation, run the analyzer, assemble the payload | Consent component |
+| Build the consent request — run the analyzer on the in-memory conversation, assemble the payload | Channel intelligence |
 | Send the consent request to the owner (notification + screen) | Consent component |
 | Collect the owner's response | Consent component |
 | Route the collected response back to the originating channel | Consent component |
@@ -154,29 +131,18 @@ The consent component's surface is **owner-facing only**. Anything the requester
 
 ## 2. How the Consent Request Component Processes the Request
 
-The Consent Request Component receives the trigger and does four things:
+The Consent Request Component receives the channel agent's pre-built package and does three things:
 
-### Step 1: Prepare the Payload
-
-A `ConsentRequestPreparer` service inside the consent component:
-- Loads the conversation through a channel-aware loader using `transcript_ref`:
-  - `inbound_call` / `outbound_call` → fetch segments from `transcript_segments` for `transcript_id` up to `transcript_snapshot_seq`
-  - `whatsapp` → fetch messages from `whatsapp_messages` for `whatsapp_conversation_id` up to and including `last_whatsapp_message_id`
-- Calls `InformationRetrievalAnalyzer.analyze_information_request(...)` to produce `summary` + `information_retrieval_prompt`
-- Assembles the `request_payload` JSONB (summary, prompt, requester info, conversation_context with transcript reference)
-
-The analyzer no longer outputs `data_sources` / `missing_data_sources` — those are dropped from the payload. The response drafting agent decides at runtime which sources to call.
-
-### Step 2: Persist to Database
+### Step 1: Persist to Database
 
 Create a `consent_requests` row:
 - Relational columns: `channel`, `user_id`, `call_id`, `task_id`, `whatsapp_conversation_id`
-- `request_payload`: the JSONB assembled in Step 1
+- `request_payload`: the JSONB blob built and passed in by the channel agent
 - `status: "pending"`
 
 This record is the single source of truth for the consent request lifecycle.
 
-### Step 3: Send Push Notification (FCM)
+### Step 2: Send Push Notification (FCM)
 
 Send a push notification to the owner's device. The FCM payload is a lightweight projection of `request_payload` plus the `request_id`:
 - `request_id` (so the UI can fetch the full record from DB)
@@ -186,14 +152,12 @@ Send a push notification to the owner's device. The FCM payload is a lightweight
 
 The notification is channel-agnostic. The FCM payload carries enough for the notification banner. When the UI opens, it fetches the full `request_payload` from DB using `request_id` to get the `conversation_context` (transcript reference for rendering the prior conversation in context).
 
-### Step 4: Return the Trigger Outcome
+### Step 3: Return the Trigger Outcome
 
 The trigger is a round trip, not fire-and-forget. The consent component returns one of two outcomes to the channel intelligence:
 
 - **Success — consent created and notified**. The consent row was created and the owner notification was sent. The result includes the `consent_request_id` so the channel intelligence can track it in session state.
-- **Failure**. The consent component could not complete preparation or notification. A single flat "failed" verdict — no failure category. The channel intelligence applies the same fallback regardless of which step failed.
-
-**The analyzer does not gate consent.** Its job is purely to ASSEMBLE the consent request payload (summary + retrieval prompt) from the transcript. The decision that consent is needed was already made by the channel intelligence when it chose to trigger; the consent component does not second-guess that decision. There is no "no consent needed" outcome — that path does not exist. This avoids a redundant LLM call (analyzer deciding + voice intelligence regenerating) and keeps the consent component's intelligence narrow: build the payload, never gate.
+- **Failure**. The consent component could not persist the row or could not send the notification. A single flat "failed" verdict — no failure category. The channel intelligence applies the same fallback regardless of which step failed.
 
 **Two-stage caller-facing messaging — no silence on the caller side.**
 
@@ -208,9 +172,9 @@ There is no caller-side waiting period: Stage 1 covers the consent component's p
 
 The consent component never speaks to the caller / WhatsApp counterpart directly. Both Stage 1 and Stage 2 are owned by the channel intelligence. The consent component only prepares, persists, notifies, and reports back.
 
-**Hard rule: the analyzer figures things out from the full transcript, not from any summary.** The consent component loads the conversation through the channel-aware loader and hands the full transcript content to the analyzer. The analyzer must never receive a pre-computed summary as its input — its verdict on "is consent needed" and its summary output both depend on having the actual conversation in front of it.
+**Hard rule: the analyzer reads the full transcript from the channel agent's session, not a pre-computed summary.** The channel agent already has the conversation in memory; it passes the full conversation_history into the analyzer when building the payload. No abbreviated summary is fed in.
 
-**Hard rule: no internal retries on the trigger path.** The consent component fails fast on the first error from any step (analyzer LLM call, DB write, FCM send, conversation load). The requester is on hold in silence during the entire trigger round trip, so internal retries — even one — extend that wait unacceptably. The channel intelligence's failure fallback is the only retry surface available; the consent component does not absorb flakiness.
+**Hard rule: no internal retries on the trigger path.** The consent component fails fast on the first error from any step (DB write, FCM send). The requester is on hold during the trigger round trip, so internal retries — even one — extend that wait unacceptably. The channel intelligence's failure fallback is the only retry surface available; the consent component does not absorb flakiness.
 
 ---
 
@@ -1049,15 +1013,13 @@ This is the behavior a text-rewrite refinement loop cannot produce and is the co
 The Consent Request Component is a **channel-agnostic, owner-facing intermediary** between channel intelligences and the device owner:
 
 **Input contract (from any channel intelligence):**
-- A trigger, not a pre-built payload. The channel intelligence passes: channel, the relational identifiers (user, call/task/whatsapp_conversation), a reference to the conversation (channel-specific shape — call transcript record + snapshot, or WhatsApp conversation + last-message-id cutoff), and the requester identity.
-- The channel intelligence does NOT run the analyzer or assemble the payload — that is the consent component's job.
+- A pre-built package. The channel intelligence runs the analyzer on its in-memory conversation, assembles the `request_payload` JSONB (summary, information_retrieval_prompt, requester identity, conversation_context with the channel-specific transcript reference), and hands the package to the consent component along with the relational identifiers (channel, user, call/task/whatsapp_conversation).
+- The consent component does NOT run the analyzer and does NOT assemble the payload — that is the channel intelligence's job.
 
 **Processing:**
-- Load the referenced conversation through a channel-aware loader
-- Run the analyzer to produce summary + retrieval prompt; assemble the payload (no data-source classification arrays)
-- Persist the row
+- Persist the row using the channel agent's pre-built payload
 - Send the owner-facing notification
-- Return the trigger outcome (success with request id, or failure with reason) to the channel intelligence as a synchronous round trip
+- Return the trigger outcome (success with request id, or failure) to the channel intelligence as a synchronous round trip
 - Run a Pydantic AI agent on demand via SSE (`/consent-request/{id}/agent-turn`) — the agent calls on-device tools through a deferred-tool side-channel POST (`/tool-result`) and streams the final draft back token-by-token
 
 **Output contract (to the UI):**
