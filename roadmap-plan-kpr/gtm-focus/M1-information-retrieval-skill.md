@@ -1,6 +1,10 @@
-# M1 — Third-Party Data Sources: Multi-Provider Integration via Composio
+# M1 — Information Retrieval Skill
 
-> **Milestone:** M1 — Data Source Connections (Owner: KPR). See `gtm-milestone-plan.md` for the milestone-level demo and beta total.
+> **Milestone:** M1 — Information Retrieval Skill (Owner: KPR). See `gtm-milestone-plan.md` for the milestone-level demo and beta total.
+>
+> **What this skill is:** the unified information-retrieval capability that both the consent-request agent and the main chat agent invoke whenever they need data about the user — whether that data lives in a **third-party provider** (Gmail, Calendar, Contacts via Composio), on the **user's device** (device calendar, contacts, OTP, location, etc.), or in **Trybo's own database** (transcripts, summaries — future).
+>
+> **Scope of this document:** the **third-party data source** layer of the Information Retrieval Skill — toolkit enablement, OAuth/permission flow via Composio, connection lifecycle, and the React Native surface that lets the user see and manage connected sources. The data-fetch service that the agent calls (the skill's execution layer) and the device-source path are tracked as follow-on phases of the same M1 effort and are explicitly deferred from this document — see "What M1 Explicitly Defers" below.
 >
 > **Governing principle:** Every third-party integration goes through Composio. We do not build provider-specific OAuth, token storage, or API clients in our repo for any third-party data source going forward.
 
