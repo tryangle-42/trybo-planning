@@ -1,4 +1,8 @@
-# Third-Party Data Sources — Multi-Provider Integration via Composio
+# M1 — Third-Party Data Sources: Multi-Provider Integration via Composio
+
+> **Milestone:** M1 — Data Source Connections (Owner: KPR). See `gtm-milestone-plan.md` for the milestone-level demo and beta total.
+>
+> **Governing principle:** Every third-party integration goes through Composio. We do not build provider-specific OAuth, token storage, or API clients in our repo for any third-party data source going forward.
 
 ## Context
 
@@ -29,11 +33,12 @@ Composio is **already partially integrated** in the codebase:
 | Layer | Technology |
 |---|---|
 | **Backend** | Python 3 + FastAPI (at `trybot-api/`) |
-| **Frontend** | React Native + Expo (at `trybot-ui/`) |
+| **Frontend** | React Native (bare, **not** Expo) + React Navigation 7 (at `trybot-ui/`) |
 | **Database** | Supabase (PostgreSQL + Auth + Storage + RLS) |
 | **Agent Orchestration** | LangGraph (at `trybot-api/app/agentic_mvp/`) |
 | **LLM** | OpenAI (gpt-4.1), Google Gemini, Ollama |
-| **Composio** | Migrating from raw `httpx` to official Python SDK (`composio-core`) |
+| **Composio** | Official Python SDK (`composio-core`) for connection management. Migration of raw-`httpx` adapter is deferred to the Data Fetch phase. |
+| **Mobile OAuth** | `react-native-inappbrowser-reborn` (in-app SFSafariViewController on iOS, Custom Tabs on Android) |
 
 ### Why Composio
 
@@ -126,6 +131,71 @@ This component serves two UI surfaces — both trigger the same Composio OAuth f
 | **Chat UI** | Agent needs data from a source the user hasn't connected | Inline "Connect Gmail" / "Connect Outlook" button in the chat |
 | **Consent Screen** | `missing_data_sources` includes an unconnected third-party source | "Connect [Provider]" banner (Section 4.2 of consent flow doc) |
 
+---
+
+## M1 Scope — Decisions Locked
+
+This section is the canonical truth for what M1 delivers. Anything in this section overrides earlier-doc descriptions if there is a conflict.
+
+### Composio as the Sole Path for Third-Party Data
+- **Full cutover.** No new direct provider integrations are built in our repo. Existing Google data-access code paths are removed. Login (Sign-In-with-Google) is **not** a data source and is out of scope — it stays untouched.
+- **Custom OAuth branding is dashboard-only and orthogonal to code.** Whether the user sees "Trybo" or "Composio" on the consent screen is set in Composio's dashboard per toolkit. The same code initiates the OAuth flow either way. Trybo can flip a toolkit from default to custom-branded at any time without a code change or redeploy.
+
+### V1 Enabled Data Sources
+- `gmail`, `googlecalendar`, `googlecontacts`. Nothing else in v1.
+- Future toolkits (Outlook, Slack, Notion, Drive, Dropbox, etc.) are added later by enabling them in Composio's dashboard and adding the slug to the enabled list. No code change required.
+
+### Connection Model
+- **One Composio account per `(user, source)`.** Multi-account-per-source is a future enhancement.
+- **`composio_user_id` = the user's Trybo profile ID.** No separate identity column or mapping table.
+- **Connection state is recorded in a new `user_data_source_connections` table** in Supabase, keyed by `(user_id, source_key)` with a unique constraint. Status values: `active`, `expired`. No `disconnected` value — disconnect deletes the row.
+- **Status transitions in M1 only ever write `active`.** The future Data Fetch phase is the writer that flips a row to `expired` when it observes an auth failure during a fetch attempt.
+
+### Connect, Reconnect, Disconnect
+- **Connect endpoint always revokes any existing connection for that `(user, source)` first**, then initiates fresh OAuth. The callback handler does an upsert. This serves both first-time connect and reconnect uniformly. No orphaned accounts in Composio's vault.
+- **Disconnect is a full revoke.** The backend asks Composio to revoke the OAuth grant at the provider, then deletes the row. The user sees Trybo disappear from their provider's connected-apps page.
+- **Reconnect (for `expired` rows)** uses the same connect endpoint; revoke-then-initiate handles the existing row cleanly.
+
+### OAuth Flow on Mobile
+- **In-app browser** (`react-native-inappbrowser-reborn`) opens the Composio redirect URL on the device. SFSafariViewController on iOS, Custom Tabs on Android.
+- **Callback lands on FastAPI**, not on the app. Backend verifies the connection with Composio, writes the row, then 302-redirects to a deep link.
+- **Deep-link scheme `trybo://` is registered by this milestone** on both iOS and Android. M1 owns the one-time native scaffolding (URL schemes, intent filters) and a small JS-side deep-link router in the app shell. Future deep links (share links, push deep links) reuse this router.
+- **The deep link is a notification, not a data carrier.** All persistent state is written by the backend before the deep link fires. The app's only job on receiving it is to dismiss the in-app browser, refresh connection state, and notify any waiting screen.
+
+### Data Access Boundary
+- **All Composio tool execution happens on the backend.** The React Native app never calls Composio directly. RN talks only to FastAPI; FastAPI talks to Composio.
+- **Per-source `connected_account_id`s are carried through `ExecutionContext` as a dict** keyed by source slug, replacing the previous singular field. The data-fetch adapter (in the next phase) reads from this dict.
+
+### What's Visible to the User
+- **No "Connect [Provider]" button in any settings screen.** Connections are initiated only when the agent surfaces a prompt in context (the agent owns this UX; M1 only exposes the registry, OAuth flow, and connection state).
+- **Profile screen gets a new "Connected Data Sources" card.** Tapping the card opens a screen that lists every source the user has connected, with a Disconnect button per active row and a Reconnect button per expired row. The legacy Google-specific card on the profile screen is replaced by this new card.
+
+### Legacy Google Cleanup
+- **Backend custom-OAuth code paths for Google data access are removed** as part of M1: token encryption for Google, Google API client, Google user profile token storage, and the Google data-access routes. Composio replaces all of it.
+- **Frontend Google data-access code is removed.** The account-manager helper (Calendar/Contacts data calls) is deleted. Calls in the consent service that previously fetched Google data through the frontend are rewired to call the new backend data-source endpoints.
+- **Google Sign-In login service is preserved untouched.** Login isn't wired into the app today, but the file is kept for future login integration.
+- **Legacy Google tokens stored in `user_profiles.settings_jsonb.google` are not migrated and not deleted.** The new code path never reads them. Pre-production users force-reconnect through Composio on next use.
+
+### What M1 Explicitly Defers
+The following are part of the broader Composio integration but are **not** in M1:
+- **Data fetch service** — a generic backend skill that the agent calls to fetch data from a connected source via Composio.
+- **Migration of the existing raw-`httpx` Composio adapter** for Slack/Notion/Linear/GitHub tool execution to the official SDK.
+- **LangGraph planner-prompt updates** to teach the agent which sources are connected and how to invoke the fetch skill.
+- **Skill-level error taxonomy and retry policy** (distinct error types like `connection_expired`, `composio_unavailable`, `provider_rate_limited` etc.).
+- **The writer of `status = 'expired'`** — that lives in the fetch phase, on the auth-error path.
+- **Composio webhooks** for proactive connection-status updates.
+- **Background pollers** for connection health.
+
+These deferred items will arrive in a follow-on component ("Data Source Fetch") that depends on M1's connection registry being live.
+
+### What Trybo Needs From the Owner Outside Code
+- A Composio account.
+- `COMPOSIO_API_KEY` and (only if non-default) `COMPOSIO_BASE_URL`. Both already exist as backend env vars.
+- Toolkit enablement on the Composio dashboard for `gmail`, `googlecalendar`, `googlecontacts`.
+- (Optional, any time post-launch) Custom OAuth credential registration in Google Cloud Console + paste into Composio dashboard, when "Trybo"-branded consent screens are wanted instead of "Composio"-branded ones. Code is unaffected.
+
+---
+
 ### Goals
 
 1. **Thin enabled-sources list** — backend maintains only a list of Composio toolkit slugs for which custom OAuth is configured. Labels, icons, available actions come from Composio SDK dynamically.
@@ -150,9 +220,10 @@ Instead of a large static registry defining labels, icons, actions, and auth con
 # This ensures the OAuth consent screen shows "Trybo" branding, not "Composio".
 
 ENABLED_DATA_SOURCES: list[str] = [
-    # "gmail",
-    # "googlecalendar",
-    # "googlecontacts",
+    "gmail",            # M1 v1
+    "googlecalendar",   # M1 v1
+    "googlecontacts",   # M1 v1
+    # --- Below: candidates for future enablement, NOT in M1 v1 ---
     # "googledrive",
     # "outlook",
     # "outlookcalendar",
@@ -546,7 +617,11 @@ async def list_enabled_sources():
 
 ---
 
-### Phase 3: Data Fetch Service + Migrate Existing Composio Adapter
+### Phase 3: Data Fetch Service + Migrate Existing Composio Adapter — DEFERRED (post-M1)
+
+> This phase is **not part of M1**. It belongs to the follow-on "Data Source Fetch" component. M1 lays down the registry, connection lifecycle, `ExecutionContext.connected_data_sources` dict, and the backend revoke/upsert path. The fetch service that the agent calls — and the migration of the raw-`httpx` adapter to the SDK — both arrive in the next component.
+
+
 
 Build the service that executes Composio tool calls to fetch user data. Migrate existing `marketplace_composio.py` from raw `httpx` to the SDK.
 
@@ -592,57 +667,80 @@ async def get_available_sources(user_id: str, db: Client) -> list[dict]:
 
 ---
 
-### Phase 4: Google OAuth Migration
+### Phase 4: Google Cleanup (Replace Custom Google Data-Access with Composio)
 
-Migrate the existing Google integration from custom OAuth to Composio. This eliminates custom token management, encryption, and refresh logic.
+This phase removes the existing custom-OAuth Google data-access stack. Login (Sign-In-with-Google) is **not** touched.
 
-**What gets replaced:**
+**Backend — removed:**
 
-| Current (custom) | Replaced by (Composio) |
+| Current (custom) | Why it goes |
 |---|---|
-| `google_service.py` — encrypt_and_store_tokens, refresh_tokens | Composio SDK handles token lifecycle |
-| `google_api_client.py` — direct Google API calls | `composio_client.tools.execute("GOOGLECALENDAR_LIST_EVENTS")` |
-| `google_user_profile_service.py` — token CRUD in Supabase | `user_data_source_connections` table (just stores composio_account_id) |
-| `token_encryption.py` — AES encryption for Google tokens | Not needed — Composio encrypts tokens in their vault |
-| `GoogleAuthService.ts` — React Native Google Sign-In for data access | `Linking.openURL(redirect_url)` — generic OAuth via Composio |
-| `GoogleAccountManager.ts` — account linking, token refresh | Not needed — Composio manages everything |
-| `routes/google.py` — custom OAuth endpoints | `routes/data_sources.py` — generic for all providers |
+| `google_service.py` — token storage / refresh / Calendar / Contacts orchestration | Composio handles the entire token lifecycle and the API calls. |
+| `google_api_client.py` — direct Google API HTTP client | Replaced by Composio tool execution (lives in the future Data Fetch phase, but the client is removed here as dead code). |
+| `google_user_profile_service.py` — token CRUD in `user_profiles.settings_jsonb.google` | Replaced by `user_data_source_connections` rows. |
+| `token_encryption.py` — Fernet for Google tokens | Composio encrypts in its vault. (If this file is shared with other features, only the Google paths are removed.) |
+| `routes/google.py` — `/google/encrypt-tokens`, `/google/revoke`, `/google/calendar`, `/google/search-contacts` | Replaced by `/api/data-sources/*`. |
 
-**Feature flag:** `USE_COMPOSIO_FOR_GOOGLE` in app config. Run both paths in parallel during testing. Once verified on Android + iOS, remove old code.
+**Frontend — removed:**
 
-**Note:** Google Sign-In for **authentication** (login) remains unchanged — only Google API access for **data** (calendar, contacts, drive) is migrated to Composio.
+| Current (frontend) | Why it goes |
+|---|---|
+| `GoogleAccountManager.ts` — Google account linking and Calendar/Contacts data calls from RN | RN no longer talks to Google directly. Connection state comes from `user_data_source_connections`; data fetches are server-side. |
+| `GoogleIntegrationCard` (Profile-screen card) | Replaced by the new `ConnectedDataSourcesCard` (covered in Phase 5). |
+| Calls inside the consent service that previously invoked `GoogleAccountManager.getCalendarEvents()` / `searchContactsByPhone()` | Rewired to call the new backend data-source endpoints instead. |
 
----
+**Frontend — preserved (out of scope):**
+- `GoogleAuthService.ts` is **not** touched. Login-via-Google isn't wired into the app today, but the file is preserved for future login integration. It is not deleted, not modified.
 
-### Phase 5: Frontend Integration (React Native — Chat UI + Consent Screen)
+**Legacy data is not migrated.** Existing Google tokens in `user_profiles.settings_jsonb.google` are left in place; no cleanup migration runs. The new code path never reads them. Because Trybo is pre-production, leftover JSONB tokens are harmless dead bytes.
 
-Wire the React Native frontend to use the new connection endpoints and render connect buttons.
-
-**Consent Screen Changes:**
-- The existing rendering logic (Section 4.2 of consent flow doc) checks `grant_method` for each missing source
-- For sources in `ENABLED_DATA_SOURCES` with `grant_method == "composio_oauth"`:
-  - Show banner: "Connect your [label] to auto-prepare your response"
-  - Button: "Connect [label]" (label from Composio SDK metadata)
-  - On tap: call `POST /api/data-sources/connect { source_key }`
-  - Open redirect URL via `Linking.openURL()`
-  - On deep link callback: re-render, fetch data, regenerate draft
-
-**Chat UI Changes:**
-- When agent responds with a connect prompt (source not connected):
-  - Render an inline connect button with the provider icon and label
-  - On tap: same OAuth flow as consent screen
-  - On success: agent automatically retries the data fetch
-
-**Data Sources Management Screen (new):**
-- Accessible from app settings
-- Lists all sources from `GET /api/data-sources/enabled` with connection status
-- Connected sources: show "Connected on [date]" + "Disconnect" button
-- Not connected: show "Connect" button
-- Expired: show "Reconnect" button
+**No feature flag.** This is a full cutover (not a dual-run). Pre-production users who previously connected Google force-reconnect through Composio on their next interaction that needs Google data.
 
 ---
 
-### Phase 6: Agent Awareness + LangGraph Planner Prompt
+### Phase 5: Frontend Integration (React Native)
+
+This phase wires the React Native app to the new backend endpoints, registers the deep-link scheme, and adds the user-facing surface for managing connected sources. The app is **bare React Native** (not Expo).
+
+**Native scaffolding — `trybo://` deep-link scheme (one-time, owned by M1):**
+- iOS: register the `trybo` scheme in the app's `Info.plist` URL types.
+- Android: add an intent filter to the main activity for `android:scheme="trybo"`.
+- JS: register a single deep-link listener at app startup that routes by path. `data-sources/connected` is the first consumer; future deep links plug in alongside.
+
+**In-app browser dependency:**
+- Add `react-native-inappbrowser-reborn` and link the iOS pod / Android module.
+- All OAuth redirects open through this in-app browser. The browser is told to dismiss when it sees a URL starting with the `trybo://` scheme — this hands control back to the app cleanly when the backend's 302-redirect-to-deep-link fires.
+
+**API client + state:**
+- A new RN-side data-sources service wraps the four `/api/data-sources/*` endpoints (initiate-connect, list, status, disconnect).
+- A new Redux slice holds the user's connection list. It's refreshed on the management screen mount and on every deep-link callback.
+
+**Profile screen — card replacement:**
+- The existing `GoogleIntegrationCard` is removed.
+- A new **Connected Data Sources** card takes its place. The card shows a brief summary (e.g., a count of currently-connected sources) and is tappable.
+
+**Connected Data Sources screen (new):**
+- Tapping the card opens a dedicated screen.
+- The screen lists every row from `user_data_source_connections` for the current user.
+- Each `active` row shows a Disconnect button. Disconnect calls the backend, which revokes at Composio and deletes the row; the screen refreshes.
+- Each `expired` row shows a Reconnect button. Reconnect calls the same connect-initiate endpoint (which revokes the old account first, then runs fresh OAuth).
+- The screen has **no Connect button**. New connections are initiated only by the agent in chat context. (Agent UX is out of M1's scope.)
+
+**Consent flow rewire:**
+- Calls inside the consent service that previously fetched Google data through `GoogleAccountManager` are rewired to call the new backend data-source endpoints. (The actual data-fetch endpoint arrives in the post-M1 fetch phase; M1 leaves these call sites stubbed or behind a "data fetch unavailable" path until the fetch phase ships.)
+
+**Out of scope for Phase 5:**
+- No inline "Connect [Provider]" buttons inside chat bubbles. The agent owns chat-side affordances; M1 does not modify chat-bubble rendering.
+- No replacement of `Linking.openURL` patterns elsewhere in the app.
+- No changes to login flows.
+
+---
+
+### Phase 6: Agent Awareness + LangGraph Planner Prompt — DEFERRED (post-M1)
+
+> This phase is **not part of M1**. The planner-prompt rewrite, the new `data_source_fetch` skill, and the orchestration changes that teach the agent to consult `connected_data_sources` all live in the follow-on "Data Source Fetch" component. M1 only ensures the dict is populated and reaches `ExecutionContext`.
+
+
 
 Update the agent's planner prompt and LangGraph orchestration to be aware of connected data sources.
 
@@ -869,19 +967,26 @@ services/permissionService.ts            UNCHANGED — device sources stay as-is
 
 ---
 
-## Total Effort
+## Total Effort — M1 Only
 
-| Phase | Hours | Days (8h/day) |
-|-------|-------|---------------|
-| P1 — Composio Python SDK + database | 4.75 | 0.6 |
-| P2 — FastAPI connection endpoints | 6.5 | 0.8 |
-| P3 — Data fetch service + migrate marketplace_composio.py | 6.5 | 0.8 |
-| P4 — Google OAuth migration | 4.25 | 0.5 |
-| P5 — React Native integration (chat UI + consent screen + settings) | 15 | 1.9 |
-| P6 — LangGraph agent awareness + planner prompt | 7 | 0.9 |
-| End-to-end device testing (Android + iOS) | 9 | 1.1 |
-| **Total** | **53 hours** | **~6.5 days** |
+| Phase | In M1? | Hours | Days (8h/day) |
+|-------|--------|-------|---------------|
+| P1 — Composio Python SDK + database | ✅ | 4.75 | 0.6 |
+| P2 — FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled) | ✅ | 6.5 | 0.8 |
+| P3 — Data fetch service + migrate `marketplace_composio.py` | ❌ deferred | — | — |
+| P4 — Google cleanup (remove backend custom-OAuth Google data path) | ✅ | 4.25 | 0.5 |
+| P5 — React Native integration (deep-link scaffolding, in-app browser, Profile card replacement, Connected Data Sources screen, consent rewire) | ✅ | 15 | 1.9 |
+| P6 — LangGraph agent awareness + planner prompt + fetch skill | ❌ deferred | — | — |
+| End-to-end device testing (Android + iOS) for the connect / disconnect / reconnect / deep-link / browser-return flows | ✅ | 9 | 1.1 |
+| **M1 Total** | | **39.5 hours** | **~5 days** |
 
-**Recommended order:** P1 (day 1) → P2 (day 1-2) → P3 (day 2-3) → P4 (day 3, once Google custom OAuth is configured in Composio) → P5 + P6 in parallel (day 3-5) → E2E device testing (day 5-7)
+> Deferred items (P3 + P6) move to the follow-on **Data Source Fetch** component, which depends on M1 being live. Combined deferred budget from the original plan was ~13.5 hours (~1.7 days); that lands in the next ticket.
 
-Note: P5 and P6 can overlap since React Native integration and LangGraph agent awareness touch different parts of the codebase. P4 depends on KPR having configured Google custom OAuth in Composio's dashboard. The critical path is: P1 → P2 → P3 → P5 (React Native needs FastAPI endpoints and fetch service ready).
+**Recommended order for M1:**
+- Day 1: P1 (SDK + DB migration) → start P2 (connect + callback endpoints).
+- Day 2: finish P2 (list / status / disconnect / enabled) → start P4 (backend Google cleanup).
+- Day 3: finish P4 → start P5 (deep-link scaffolding + in-app browser dependency).
+- Day 4: P5 (Profile card replacement, Connected Data Sources screen, consent rewire stubs).
+- Day 5: E2E device testing on Android + iOS for the full connect / disconnect / reconnect / deep-link return loop.
+
+**Critical path:** P1 → P2 → P5. P4 can run alongside P5 once P2 is done. P3 and P6 are not gated by M1's calendar; they ship separately as the Data Source Fetch component.
