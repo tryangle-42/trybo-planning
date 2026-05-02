@@ -31,7 +31,7 @@ The clean test for C1: *would this exist even if Trybo had no LLMs, no skills, n
 
 ## 2. Mission
 
-Provide the **shared, domain-agnostic substrate** that every other layer depends on, so that L2/L3/L4/L5 components — and every skill — can assume a stable, multi-tenant, observable, recoverable runtime without each one re-implementing core infrastructure.
+Provide the **shared, domain-agnostic substrate** that every other layer depends on, so that L2/L3/L4/L5 components — and every skill — can assume a stable, user-scoped, observable, recoverable runtime without each one re-implementing core infrastructure.
 
 Two non-negotiables that flow from this:
 
@@ -63,7 +63,7 @@ Each surface is a long-term architectural commitment. Each gets a sub-section in
 | **C1.3** | Event Bus & Streaming Spine | Pub/sub, fan-out, replay, DLQ, SSE/WS distribution |
 | **C1.4** | State & Checkpoint Store | Distributed locks, durable idempotency, checkpoint versioning |
 | **C1.5** | Session / Working-State Layer | Two-tier (in-mem + Redis) ephemeral state for live interactions |
-| **C1.6** | Identity, Tenancy & Access | Auth, multi-tenant primitives, RBAC, rate limits, cost ceilings |
+| **C1.6** | Identity & Access | Auth, user-scoped session handling, rate limits, cost ceilings (tenancy / RBAC deferred — see C1.6 open questions) |
 | **C1.7** | Configuration & Feature Flags | Typed config, secrets, hot-reload, %/cohort flags |
 | **C1.8** | Outbound HTTP Substrate | Centralized client, pooling, retries, breakers, signing |
 | **C1.9** | Inbound Protocol Bridge | REST + SSE + WS + webhook normalization, dedup, sigverify |
@@ -171,43 +171,47 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 
 ### C1.2 — Persistence Substrate
 
-**Mission.** A single, RLS-safe persistence layer that every other layer reads/writes through. Owns the contract for *how* data is stored, not *what* data is stored. Multi-tenant from day one, transactional, migration-versioned, and disaster-recoverable.
+**Mission.** A single, RLS-safe persistence layer that every other layer reads/writes through. Owns the contract for *how* data is stored, not *what* data is stored. User-scoped, transactional, migration-versioned, and disaster-recoverable. (Multi-tenancy posture is a deferred, open decision — see open questions.)
 
 **Sub-components.**
-- **DB client** — connection pool, RLS-aware Supabase client wrapper, service-role bypass for admin paths. `db.tenant(tenant_id).table("...").select(...)` — tenant scope is enforced at the wrapper level, not at every call site.
+- **DB client** — connection pool, RLS-aware Supabase client wrapper, service-role bypass for admin paths. Today: `db.user(user_id).table("...").select(...)` — user scope is enforced at the wrapper level via Supabase RLS (`auth.uid()`). Tenant-scoping is *not* assumed; if shared-DB tenancy is ever introduced (open question), it would layer in here without rewriting call sites.
 - **Transaction support** — Postgres functions invoked via `rpc()` for multi-table atomic operations (e.g., create batch + tasks + audit entries in one shot). No half-written states.
 - **Migration tooling** — versioned, forward + reverse, blue-green-safe (all migrations must be backward-compatible with the previous app version). Lives in `trybot-ui/supabase/migrations/` today; long-term we want it in this repo or a shared submodule.
 - **File / object storage** — Supabase Storage buckets per data class (audio, documents, images), with signed URLs and lifecycle policies (auto-expire to comply with C1.12 retention).
-- **Vector storage** — pgvector with a single `embeddings` table indexed by `(tenant_id, namespace, owner_id)`. HNSW indexes. Used by L4 (semantic memory) and L3 (skill discovery) — but the substrate is here, the schema/policies are theirs.
+- **Vector storage** — pgvector with a single `embeddings` table indexed by `(user_id, namespace, owner_id)`. HNSW indexes. Used by L4 (semantic memory) and L3 (skill discovery) — but the substrate is here, the schema/policies are theirs.
 - **Archival & cold storage** — old data (closed runs > 6 months, deleted users in grace period, etc.) tiers to cold storage (GCS) on a scheduled job. Read-on-demand with a slow path.
 - **Backup & DR** — Supabase daily backups + a weekly export to a secondary region; documented RPO/RTO; restore-drill cadence.
 
 **Key contracts.**
 - Internal API: `DbClient`, `StorageClient`, `VectorClient`, `MigrationRunner`.
-- Schema: every domain table includes `id UUID`, `tenant_id UUID NOT NULL`, `created_at TIMESTAMPTZ`, `updated_at TIMESTAMPTZ`, plus RLS policies enforcing `tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'`.
+- Schema: every domain table includes `id UUID`, `user_id UUID NOT NULL` (where applicable), `created_at TIMESTAMPTZ`, `updated_at TIMESTAMPTZ`, plus Supabase RLS policies enforcing user-scoped access via `auth.uid()`.
 - Event: `data.migration.applied`, `data.archival.run`, `data.backup.completed`.
 
 **Integration points.**
-- C1.6 Identity — `tenant_id` flows from JWT claims into the DB client's session vars.
+- C1.6 Identity — `user_id` flows from Supabase JWT claims into RLS via `auth.uid()`.
 - C1.10 Background Work — archival, backup, retention all run as scheduled jobs.
 - C1.12 Compliance — retention policies and erasure pipelines call into this layer.
 - L3/L4/L7 — every skill, memory, and persistence concern consumes this.
 
-**Current state.** Supabase client + RLS at user level only (no tenant scope). No multi-table transactions. Migrations live in sibling repo. Storage exists. Vector tables not deployed. Archival not built. Backups via Supabase only (no secondary region).
+**Current state.** Supabase client + RLS at user level (phone-OTP auth). No multi-table transactions. Migrations live in sibling repo. Storage exists. Vector tables not deployed. Archival not built. Backups via Supabase only (no secondary region).
 
-**Long-term target.** Tenant-scoped client primitive. Multi-table transactions for any multi-row write. Migrations co-located + blue-green-safe. pgvector deployed and shared by L3/L4. Tiered archival. Documented RPO ≤ 1h, RTO ≤ 4h with quarterly restore drills.
+**Long-term target.** Hardened user-scoped client primitive. Multi-table transactions for any multi-row write. Migrations co-located + blue-green-safe. pgvector deployed and shared by L3/L4. Tiered archival. Documented RPO ≤ 1h, RTO ≤ 4h with quarterly restore drills. Tenancy posture (shared-DB or DB-per-tenant) remains an open question, not part of the long-term plan.
 
 **Phased roadmap.**
 | Phase | Scope | Effort |
 |---|---|---|
-| P1 | `tenant_id` migration on existing tables; tenant-aware DB client wrapper; transaction RPC pattern | L |
+| P1 | User-scoped DB client wrapper hardening; transaction RPC pattern; RLS policy audit on existing tables | M |
 | P2 | pgvector deploy + `embeddings` table; signed-URL helper for storage | M |
 | P3 | Migration tooling co-located + reverse-migration discipline; blue-green migration playbook | M |
 | P4 | Archival tier + retention sweeper (consumes C1.12 retention policies) | M |
 | P5 | Secondary-region backup + restore drill | M |
 
 **Open questions.**
-- Tenant model: single user = single tenant, or do we want explicit `orgs` for B2B / multi-user accounts from day one? (Schema cost is paid once.)
+- **Multi-tenancy posture (deferred decision — no commitment).** Three plausible futures, all open:
+  - (a) **Stay user-scoped indefinitely.** Trybo remains B2C; tenancy never lands.
+  - (b) **DB-per-tenant / per-deployment** for B2B and on-prem. Same code, same migrations, separate database per customer. Common ask from enterprise / regulated buyers; preserves the current OTP auth flow and code paths; no schema pollution.
+  - (c) **Shared-DB multi-tenancy** with `tenant_id` columns + RLS rewrite. Largest retrofit cost: includes auth-flow rewrite (phone OTP → tenant-scoped JWTs), invite/membership UX, RLS migration on a live and already-large DB. Only justified if many small B2B tenants on a single deployment is the actual product shape.
+  - **No work is scheduled.** We will not introduce `tenant_id` columns or rewrite auth speculatively. The decision is held open until a concrete B2B use case forces it.
 - Do we move migrations into this repo or keep them in `trybot-ui`? (Currently a coordination headache.)
 - Is `pgvector` in Supabase Pro tier sufficient for L4 long-term, or do we need a dedicated vector DB at scale?
 
@@ -221,7 +225,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 
 **Sub-components.**
 - **Pub/sub core** — channel-keyed subscriber registry, in-process fan-out, ordered delivery per channel.
-- **Persistence** — every event written to an append-only log table (`event_log`) with `(tenant_id, channel, seq, event_type, payload, created_at)`. Seq is per-channel monotonic.
+- **Persistence** — every event written to an append-only log table (`event_log`) with `(user_id, channel, seq, event_type, payload, created_at)`. Seq is per-channel monotonic.
 - **Replay** — `bus.replay(channel, from_seq)` returns events from a given offset. Critical for crashed consumers and for late-joining clients.
 - **Dead-letter queue** — `event_dlq` for events whose subscribers fail beyond max retries. Inspectable, requeueable.
 - **Cross-instance fan-out** — at multi-instance scale, in-process fan-out is insufficient. Long-term: bus messages also published to GCP Pub/Sub or Redis Streams so subscribers on other instances receive them.
@@ -229,7 +233,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 - **Schema versioning** — event payloads versioned (`event_type@v2`); subscribers tolerant of unknown fields, breaking changes go through a coexistence period.
 
 **Key contracts.**
-- Internal API: `bus.publish(channel, event_type, payload, tenant_id)`, `bus.subscribe(channel_pattern, handler)`, `bus.replay(channel, from_seq)`, `bus.dead_letter(reason)`.
+- Internal API: `bus.publish(channel, event_type, payload, user_id)`, `bus.subscribe(channel_pattern, handler)`, `bus.replay(channel, from_seq)`, `bus.dead_letter(reason)`.
 - Channel naming convention: `<domain>.<entity>.<action>` (e.g., `run.node.completed`, `consent.request.created`, `system.instance.started`).
 - Event taxonomy is versioned and lives in a shared module — additions are non-breaking, removals require a deprecation window.
 
@@ -267,13 +271,13 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 - **LangGraph checkpoint backend** — `langgraph-checkpoint-postgres` against Supabase. Already deployed (`public.checkpoints`, `checkpoint_blobs`, `checkpoint_writes`).
 - **Distributed locking** — Redis `SETNX` lock on `checkpoint:{run_id}` with TTL on resume, so two instances can't resume the same run. Lock TTL ≥ max single-step duration; refresh on long-running steps.
 - **Durable idempotency** — content-addressable `(skill_id, input_hash)` set in Redis (and persisted), not in-memory. Survives restarts.
-- **Checkpoint metadata** — every checkpoint tagged with `saved_at, schema_version, component, run_id, tenant_id` for debuggability and migration.
+- **Checkpoint metadata** — every checkpoint tagged with `saved_at, schema_version, component, run_id, user_id` for debuggability and migration.
 - **Checkpoint versioning** — when state shape changes, old checkpoints either migrate forward (best) or are marked unresumable with a clear error.
 - **GC & retention** — completed-run checkpoints aged out per retention policy (tied to C1.12). Default: 30 days.
 
 **Key contracts.**
 - Internal API: `lock_manager.acquire(key, ttl)`, `lock_manager.refresh(key)`, `idempotency.has(key)`, `idempotency.mark(key, result_hash)`.
-- Tables: existing LangGraph tables; new `idempotency_keys (tenant_id, key, marked_at, result_ref)`.
+- Tables: existing LangGraph tables; new `idempotency_keys (user_id, key, marked_at, result_ref)`.
 - Event: `checkpoint.saved`, `checkpoint.resumed`, `lock.contention.detected`.
 
 **Integration points.**
@@ -337,45 +341,48 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 
 ---
 
-### C1.6 — Identity, Tenancy & Access
+### C1.6 — Identity & Access
 
-**Mission.** Authenticate every request, scope everything to a tenant, enforce per-user / per-org / per-tier limits, and provide the primitives for RBAC and account lifecycle.
+**Mission.** Authenticate every request, scope everything to the calling user, enforce per-user / per-tier limits, and provide the primitives for account lifecycle. (RBAC, orgs, and tenancy are deferred decisions — see open questions.)
 
 **Sub-components.**
-- **JWT auth** — Supabase JWT validation; FastAPI `Depends(get_authenticated_user)` extracts identity. Token refresh handled with explicit refresh endpoint and 401 → refresh → retry on the client.
-- **Tenant scope** — every authenticated request resolves to `(user_id, tenant_id)`. Tenant flows into the DB client via session vars, into RLS via JWT claim.
-- **Role-based access control** — long-term: `(tenant_id, user_id, role)` membership table, with roles `owner | admin | member | viewer`. FastAPI dependencies compose: `Depends(get_user) → Depends(get_membership) → Depends(require_role("admin"))`. Pattern follows the standard `Depends`-chain idiom.
-- **Rate limiting** — per-user and per-(tenant, route) sliding-window counters in Redis. Library: `slowapi` or `fastapi-limiter`. Returns 429 with `Retry-After`.
-- **Cost ceilings** — separate from rate limits. Token-bucket per (tenant, plan) decremented before LLM/tool calls. Hard ceiling per billing period; soft ceiling triggers in-app warning. Independent of rate limits because expensive calls (long LLM completions) cost more than cheap ones.
-- **Account lifecycle** — registration, email/phone verification, OTP, password-less, account deletion (compliance hook in C1.12), session revocation.
+- **JWT auth** — Supabase JWT validation (phone OTP today); FastAPI `Depends(get_authenticated_user)` extracts identity. Token refresh handled with explicit refresh endpoint and 401 → refresh → retry on the client.
+- **User scope** — every authenticated request resolves to `user_id`. Flows into the DB client via Supabase auth claims, into RLS via `auth.uid()`. (Tenant scope is *not* assumed; see open questions.)
+- **Role-based access control** — *deferred*. Not built today. If shared-DB tenancy is ever adopted (open question), RBAC layers on top via a `(tenant_id, user_id, role)` membership table with roles `owner | admin | member | viewer` and a `Depends`-chain idiom. Until then, all paths are single-user; service-role token gates admin paths.
+- **Rate limiting** — per-user and per-route sliding-window counters in Redis. Library: `slowapi` or `fastapi-limiter`. Returns 429 with `Retry-After`.
+- **Cost ceilings** — separate from rate limits. Token-bucket per (user, plan) decremented before LLM/tool calls. Hard ceiling per billing period; soft ceiling triggers in-app warning. Independent of rate limits because expensive calls (long LLM completions) cost more than cheap ones.
+- **Account lifecycle** — registration, phone OTP verification, password-less, account deletion (compliance hook in C1.12), session revocation.
 - **Service-role auth** — admin/internal paths use a service-role token; never exposed to clients.
 
 **Key contracts.**
-- Internal API: `auth.get_user(req)`, `auth.get_tenant(req)`, `auth.require_role(role)`, `rate_limit.check(key)`, `cost_ledger.spend(tenant_id, amount)`.
-- Tables: existing `user_profiles`; new `tenants`, `tenant_memberships (tenant_id, user_id, role)`, `cost_ledger (tenant_id, period_start, spent, limit)`.
-- Events: `auth.session.created`, `auth.session.revoked`, `tenancy.member.added`, `tenancy.member.removed`, `cost.ceiling.warned`, `cost.ceiling.exceeded`.
+- Internal API: `auth.get_user(req)`, `rate_limit.check(key)`, `cost_ledger.spend(user_id, amount)`. Tenancy / RBAC APIs (`auth.get_tenant`, `auth.require_role`) reserved for future, gated on the multi-tenancy decision.
+- Tables: existing `user_profiles`; new `cost_ledger (user_id, period_start, spent, limit)`. `tenants` / `tenant_memberships` deferred.
+- Events: `auth.session.created`, `auth.session.revoked`, `cost.ceiling.warned`, `cost.ceiling.exceeded`. Tenancy events (`tenancy.member.*`) deferred.
 
 **Integration points.**
-- C1.2 Persistence — RLS depends on tenant claim.
+- C1.2 Persistence — RLS depends on user claim today; tenant claim only if shared-DB tenancy is ever adopted.
 - C2 Execution Tools — every tool call passes through cost ledger spend.
 - L2 Planner — checks cost ceiling before kicking off expensive plans.
 - C1.12 Compliance — account deletion drives erasure pipeline.
 
-**Current state.** JWT + RLS at user level. No tenancy model. No RBAC. No rate limits. No cost ceilings. Account deletion exists.
+**Current state.** JWT (phone OTP) + RLS at user level. No tenancy model. No RBAC. No rate limits. No cost ceilings. Account deletion exists.
 
-**Long-term target.** Multi-tenant from day one. Roles enforceable at the dependency layer with a single-line idiom. Rate limits and cost ceilings keyed by `(tenant, plan)` and surfaced to clients via headers + 429s.
+**Long-term target.** Hardened user-scoped auth, with rate limits and cost ceilings keyed by `(user, plan)` and surfaced to clients via headers + 429s. Tenancy / RBAC remain optional layers — introduced only if a B2B path forces them, see open questions.
 
 **Phased roadmap.**
 | Phase | Scope | Effort |
 |---|---|---|
-| P1 | `tenants` + `tenant_memberships`; tenant claim in JWT; tenant-aware DB client (paired with C1.2 P1) | L |
-| P2 | RBAC dependency chain; first roles: owner / member | M |
-| P3 | Rate limiting with `slowapi` + Redis backend; per-route configs | M |
-| P4 | Cost ledger primitive; per-plan ceilings; in-app warning + 402 on hard ceiling | L |
-| P5 | Service-role hardening + admin-path audit | S |
+| P1 | Rate limiting with `slowapi` + Redis backend; per-route configs | M |
+| P2 | Cost ledger primitive (user-scoped); per-plan ceilings; in-app warning + 402 on hard ceiling | L |
+| P3 | Service-role hardening + admin-path audit | S |
+| P4 | *(Deferred — not scheduled.)* Tenancy + RBAC layers. Only triggered by a concrete B2B use case. Includes `tenants` + `tenant_memberships`, tenant claim in JWT, auth-flow rewrite from phone OTP to tenant-scoped login, RLS migration on a live DB. Costs are non-trivial; see open questions for the three-way deferred decision. | XL |
 
 **Open questions.**
-- Do we model "tenant" as an organization (B2B-ready) from day one, or as a synonym for user (B2C-only)? My recommendation: org-model from day one — schema cost is one-time, retrofitting is painful. Single-user tenants are just an org of size 1.
+- **Multi-tenancy posture (deferred decision — open until a concrete B2B use case lands).** Three plausible futures, all open:
+  - (a) **Stay user-scoped indefinitely** — Trybo remains B2C.
+  - (b) **DB-per-tenant / per-deployment** — same code, same migrations, separate DB per B2B customer. Common ask from enterprise / regulated buyers; on-prem-friendly; preserves OTP auth and current code paths.
+  - (c) **Shared-DB multi-tenancy** with `tenant_id` columns + RLS rewrite + auth-flow rewrite. Largest retrofit; only justified if many small B2B tenants on a single deployment is the actual product shape.
+  - **No work scheduled now.** We do not pay the auth rewrite, schema retrofit, or RLS migration cost speculatively. Revisit only when a buyer / use case forces a decision.
 - Cost ceilings — who defines "plan"? Billing system not built yet. Recommend a hardcoded plan map until billing exists; cost ceiling primitive lands first.
 
 ---
@@ -389,7 +396,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 - **Hot reload** — Cloud Run is request-driven, so SIGHUP-style daemon reloads don't apply. Pattern: a Pub/Sub topic `config.changed` triggers a `force_latest=True` invalidation + reload. Bounded set of "hot" config keys (LLM model selection, rate-limit overrides, MCP server list); the rest is restart-only.
 - **Secret management** — env vars for now; long-term, GCP Secret Manager with rotation. KMS keys for application-level encryption (C1.12).
 - **Feature flags** — OpenFeature Python SDK as the vendor-neutral interface. Provider: GrowthBook (richest cohort/attribute targeting, free) or self-hosted Unleash. Decision deferred until we actually need percent rollouts.
-- **Per-skill / per-tool config** — flags can target by `(tenant_id, user_id, plan, route)`. Cohort targeting drives canary rollouts of new skills, new providers, new prompt versions.
+- **Per-skill / per-tool config** — flags can target by `(user_id, plan, route)`. Cohort targeting drives canary rollouts of new skills, new providers, new prompt versions.
 - **Config versioning** — tracked in git; production rollouts via PR + Cloud Run revision deploy. No database-backed config admin (yet).
 
 **Key contracts.**
@@ -399,7 +406,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 **Integration points.**
 - Every layer reads config; few write it.
 - C1.3 Event Bus — `config.changed` triggers in-process invalidation.
-- C1.6 — flags can target on tenant/role/plan, requires identity context.
+- C1.6 — flags can target on user/plan, requires identity context.
 
 **Current state.** Pydantic-settings exists. Env-var only. No hot reload. No feature flags (just env booleans).
 
@@ -479,7 +486,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 
 **Key contracts.**
 - Internal API: `webhook_handler.normalize(provider, raw_payload) → InternalEvent`, `signature.verify(provider, raw_payload, headers)`.
-- Middleware: `RequestContextMiddleware` sets `request_id`, `tenant_id`, `user_id` into a `contextvar`.
+- Middleware: `RequestContextMiddleware` sets `request_id`, `user_id` into a `contextvar`.
 - Events: `webhook.received`, `webhook.deduplicated`, `webhook.signature.failed`.
 
 **Integration points.**
@@ -525,7 +532,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 
 **Key contracts.**
 - Internal API: `jobs.enqueue(type, payload, schedule=None, priority=normal)`, `jobs.cancel(id)`, `jobs.register_handler(type, fn)`.
-- Tables: `jobs (id, tenant_id, type, payload, status, attempts, scheduled_at, ...)`, `job_dlq`.
+- Tables: `jobs (id, user_id, type, payload, status, attempts, scheduled_at, ...)`, `job_dlq`.
 - Events: `job.enqueued`, `job.started`, `job.completed`, `job.failed`, `job.dead_lettered`.
 
 **Integration points.**
@@ -558,7 +565,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 **Mission.** Everything that happens — every request, every node, every tool call, every bus event — is observable. Logs structured, traces propagated through async boundaries, metrics aggregated, generic audit log queryable. Standard semantic conventions.
 
 **Sub-components.**
-- **Structured logging** — `structlog`, JSON output, with `trace_id`, `tenant_id`, `user_id`, `request_id` automatically attached from contextvars.
+- **Structured logging** — `structlog`, JSON output, with `trace_id`, `user_id`, `request_id` automatically attached from contextvars.
 - **Distributed tracing** — OpenTelemetry SDK with OTLP exporter. Spans for: HTTP request (root), planner LLM call, plan compilation, each node execution, each tool/adapter call, each DB query (sampled). **GenAI semantic conventions** for LLM/tool spans (`gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.tool.name`).
 - **Async context propagation** — contextvars carry trace context across `asyncio.create_task` and LangGraph's `Send` parallel fanout. The fix: any spawn that crosses the active span must explicitly carry context (`opentelemetry.context.attach`/`detach` in a try/finally) — documented as a coding pattern.
 - **Metrics** — RED metrics (Rate, Errors, Duration) per route + per skill + per provider. Plus token/cost metrics from LLM spans.
@@ -569,7 +576,7 @@ Effort estimates are deliberately bands (S/M/L/XL = ~2 / ~5 / ~10 / ~20+ dev-day
 **Key contracts.**
 - Internal API: `tracer.start_span()`, `logger.bind(...)`, `metrics.observe(...)`, `audit.record(actor, action, target, metadata)`.
 - Span attributes follow GenAI semconv where applicable; everything else uses standard HTTP/DB semconv.
-- Audit log schema: `(id, tenant_id, actor_id, actor_type, action, target_type, target_id, metadata, created_at)`.
+- Audit log schema: `(id, actor_id, actor_type, action, target_type, target_id, metadata, created_at)`.
 
 **Integration points.**
 - **Every** layer. This is the spine.
@@ -669,13 +676,13 @@ Pulled out so they're not buried in 12 sections.
 
 They cooperate constantly: a job's completion publishes an event; an event subscriber may enqueue a follow-up job. Example: `run.completed` event → memory subscriber enqueues an `episode.write` job → job worker computes the episode → publishes `memory.episode.written` event. Two systems, one flow. Conflating them is the most common platform mistake.
 
-1. **Tenant-scoped from day one.** Every primitive accepts a `tenant_id`. Single-user accounts are just orgs of size 1. Retrofitting tenancy is the most painful migration in any SaaS — pay it once, now.
+1. **User-scoped today; tenancy is a deferred, open question.** Every primitive accepts a `user_id` and uses Supabase RLS via `auth.uid()`. Tenancy — whether shared-DB with `tenant_id` columns, or DB-per-tenant deployments — is *not* assumed and not built. The decision is held open until a concrete B2B use case lands. If B2B happens, the current default assumption is **DB-per-tenant deployment** (clean code, no schema pollution, often what enterprise/on-prem buyers ask for anyway), but no path is committed. We do not pay the auth-flow rewrite, schema retrofit, or RLS migration cost speculatively.
 
 2. **Primitives, not policies.** C1 owns *machinery* (a retention sweeper, a PII redactor, a rate limiter). C1 does *not* own *rules* (what's PII, what's the retention, what's the rate limit value). Rules live in their domain layer. The primitive is configured.
 
 3. **Idempotent everything.** Every job, every retry, every webhook. C1 provides idempotency primitives; consumers must use them.
 
-4. **Async-safe context.** Trace context, tenant context, request context flow through `contextvars`. Spawning across an `asyncio.create_task` boundary requires explicit context handoff — codified as a coding rule.
+4. **Async-safe context.** Trace context, user context, request context flow through `contextvars`. Spawning across an `asyncio.create_task` boundary requires explicit context handoff — codified as a coding rule.
 
 5. **Strangler migration.** Most C1 surfaces have a current naive implementation. New code uses the substrate; old code migrates as we touch it. Set a deadline for full migration per surface (~Sept 30) so nothing rots indefinitely.
 
@@ -720,8 +727,8 @@ Anything that doesn't fit one of these is a candidate for a misclassified ticket
 
 C1 is too big to land as one block. Sequence by criticality and unblocking dependencies:
 
-**Tranche A — multi-tenant + observable foundation (must-have for any post-beta scaling).**
-- C1.6 P1-P2 (tenancy + RBAC), C1.2 P1 (tenant_id everywhere), C1.11 P1-P3 (OTel + async context), C1.1 P1-P2 (lifecycle + orphan recovery).
+**Tranche A — user-scoped + observable foundation (must-have for any post-beta scaling).**
+- C1.6 P1 (rate limits) + P3 (service-role hardening), C1.2 P1 (DB client hardening + RLS audit), C1.11 P1-P3 (OTel + async context), C1.1 P1-P2 (lifecycle + orphan recovery). Tenancy / RBAC explicitly out of scope here — see §11 open question 1.
 
 **Tranche B — outbound robustness + state safety.**
 - C1.8 P1-P4 (centralized HTTP), C1.4 P1-P2 (distributed locking + durable idempotency), C1.5 P1-P2 (Redis-backed sessions).
@@ -742,11 +749,11 @@ Tranches A and B unblock most of L2/L3/L4/C2 work. Tranche C is the operational 
 
 Ranked by how much they constrain other decisions if we get them wrong:
 
-1. **Tenant model** (single-user-as-org from day one, or B2C-only with retrofit later)? My recommendation: **org-from-day-one**. Schema is small; retrofit is huge. Locks in C1.2 P1 + C1.6 P1.
-3. **Feature-flag provider** (GrowthBook vs. Unleash)? Recommended GrowthBook — better experimentation primitives.
-4. **KMS choice** (GCP KMS vs. Supabase Vault vs. Vault)? Recommended GCP KMS.
-5. **Cross-instance fan-out** (GCP Pub/Sub vs. Redis Streams)? Defer until we're multi-instance.
-6. **DPDP Data Fiduciary registration timing** — pre-launch or post? Affects retention obligations and Grievance Officer surface.
+1. **Multi-tenancy posture (deferred — no commitment now).** Three options open: (a) stay user-scoped (B2C only); (b) **DB-per-tenant / per-deployment** for B2B and on-prem — assumed default *if* B2B happens, because it preserves the current OTP auth flow and code paths and is what enterprise/regulated buyers typically ask for; (c) shared-DB multi-tenancy with `tenant_id` everywhere — explicitly *not* recommended given the current OTP auth flow, the size of the existing DB, and the likely B2B buyer profile. **No work is scheduled.** We will not build tenancy primitives until a concrete B2B use case forces a decision.
+2. **Feature-flag provider** (GrowthBook vs. Unleash)? Recommended GrowthBook — better experimentation primitives.
+3. **KMS choice** (GCP KMS vs. Supabase Vault vs. Vault)? Recommended GCP KMS.
+4. **Cross-instance fan-out** (GCP Pub/Sub vs. Redis Streams)? Defer until we're multi-instance.
+5. **DPDP Data Fiduciary registration timing** — pre-launch or post? Affects retention obligations and Grievance Officer surface.
 
 ---
 
