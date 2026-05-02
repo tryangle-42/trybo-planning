@@ -1,10 +1,12 @@
-# M1 — Information Retrieval Skill
+# M1 — Information Retrieval Skill — Phase 2: Integration
 
 > **Milestone:** M1 — Information Retrieval Skill (Owner: KPR). See `gtm-milestone-plan.md` for the milestone-level demo and beta total.
 >
-> **Scope of this document:** the **third-party data source layer** of the Information Retrieval Skill — toolkit enablement, OAuth/permission flow via Composio, connection lifecycle, and the React Native surface that lets the user see and manage connected sources. The skill's data-fetch execution layer and the device-source path are tracked as follow-on phases of the same M1 effort and are explicitly deferred from this document — see §3.10 "What M1 Explicitly Defers".
+> **This is Phase 2 of two.** Phase 1 (`phase-1-structurization.md`) defines the contract — the category registry, the capability bundle, the uniform response envelope, the unified permission flow, the per-source adapter base class, and the runtime coordination — with **stub adapters** validating the agent run loop end-to-end. Phase 2 *fills in real integrations against that contract* — Composio third-party, device-level OS permissions, OAuth + deep-link plumbing, the React Native management surface, the migration of the existing custom Google data-access stack, the migration of the raw-`httpx` Composio adapter to the SDK, and the migration of the procedural consent flow to the new agentic pattern.
 >
-> **Governing principle:** Every third-party integration goes through Composio. We do not build provider-specific OAuth, token storage, or API clients in our repo for any third-party data source going forward.
+> **Scope of this document:** the integration layer that fills Phase 1's adapter interfaces with real code — for two categories, **third-party** (Gmail / Google Calendar / Google Contacts via Composio) and **device-level** (calendar / contacts / OTP / location via OS permissions). Internal / database sources (transcripts, summaries via vector DB) are out of scope and will arrive in a future milestone.
+>
+> **Governing principle:** Every third-party integration goes through Composio. We do not build provider-specific OAuth, token storage, or API clients in our repo for any third-party data source going forward. Device-level data continues to use the existing on-device permission service; this phase wires its registry entry into Phase 1's contract so any agent reaches it through the same skill call.
 
 ---
 
@@ -208,7 +210,42 @@ ENABLED_DATA_SOURCES: list[str] = [
 
 Adding a future toolkit is a one-line change once it's enabled in Composio's dashboard. Labels, icons, and available actions are queried from Composio's SDK at runtime — no static metadata duplicated locally.
 
-**Device sources** (`device_calendar`, `device_contact`, `device_otp`) remain in the existing consent flow registry and use native OS permissions. M1 does not touch them.
+### 3.1.1 Device Source Registry (Formalization)
+
+The other category Phase 1 makes reachable — without changing existing on-device behaviour — is **device-level sources**. These are gated by native OS permissions and read by the React Native app, never by the backend. To let Phase 2's agent-skill contract address them uniformly with third-party sources, Phase 1 formalizes the device side as a first-class registry alongside `ENABLED_DATA_SOURCES`:
+
+```python
+DEVICE_DATA_SOURCES: list[DeviceSourceEntry] = [
+    DeviceSourceEntry(source_key="device_calendar",
+                      display_label="Device Calendar",
+                      permission_key="calendar"),
+    DeviceSourceEntry(source_key="device_contacts",
+                      display_label="Device Contacts",
+                      permission_key="contacts"),
+    DeviceSourceEntry(source_key="device_otp",
+                      display_label="SMS Verification Code",
+                      permission_key="sms"),
+    DeviceSourceEntry(source_key="device_location",
+                      display_label="Device Location",
+                      permission_key="location"),
+]
+```
+
+What this formalization does in Phase 1:
+- Defines a single source-of-truth list of supported device sources, each with its display label and the OS permission key it maps to.
+- Provides a stable `source_key` namespace (`device_*`) that the agent contract in Phase 2 can address identically to third-party slugs.
+- Does **not** modify the existing `permissionService.ts` or any device-fetch code path. Phase 2 plugs into both the registry entry and the existing permission service.
+
+What this formalization does NOT do in Phase 1:
+- Does not introduce server-side fetching for device sources (impossible — device data lives on the phone).
+- Does not change the consent flow's current procedural device-data fetches (`fetchDeviceCalendar`, etc.). Those remain operational and are migrated by Phase 2.
+- Does not change OS permission prompting behaviour.
+
+**Net effect:** after Phase 1, both `ENABLED_DATA_SOURCES` (third-party slugs) and `DEVICE_DATA_SOURCES` (device entries) coexist as a uniform "registry of reachable sources". Phase 2 builds the agent-skill contract on top of both.
+
+---
+
+**Device sources** are reachable via the existing on-device permission service. Phase 1 formalizes them as a registry entry (above) so the Phase 2 contract can plug in. Phase 1 does not modify existing device-fetch behaviour.
 
 ### 3.2 Connection State (Database)
 
