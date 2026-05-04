@@ -4,7 +4,7 @@
 >
 > **This is Phase 1 of two.** Phase 1 *defines the contract* by which any agent in the system communicates with the Information Retrieval Skill — the category registry, the capability bundle, the uniform response envelope, the unified permission flow, the per-source adapter pattern, and the runtime coordination. The actual data-source integrations (Composio third-party + device-level OS permissions + the OAuth/deep-link/RN management surface) are built against this contract in Phase 2 (`phase-2-integration.md`). Defining the contract first means each integration is a mechanical fill against a stable interface, not a bespoke build that has to be retrofitted later. Adding new sources after Phase 2 (Outlook, Slack, Notion, …) is a registry-only change.
 >
-> **Scope of this document:** the agent ↔ skill communication contract, the per-source adapter pattern, the runtime coordination (LangGraph), the device-source `interrupt()` bridge, and the migration plan for the existing procedural consent flow to the new agentic pattern. Real adapters are stubbed in Phase 1 (canned envelopes for runtime-loop validation); they get filled in with real Composio / OS-permission code in Phase 2. The **only callers** of this skill, now and in the future, are the **consent-request agent** (drafts replies for inbound consent) and the **main chat agent** (responds to the owner directly). Communication / channel agents (call, WhatsApp, etc.) do **not** call this skill directly — when they need user data, they go through one of these two agents.
+> **Scope of this document:** the agent ↔ skill communication contract, the per-source adapter pattern, the runtime coordination (LangGraph for the main agent), the device-source `interrupt()` bridge for the main agent, and the **plumbing-reroute plan** for the existing Pydantic AI consent flow (executed in Phase 2 — its agent architecture is preserved, only the data-fetch step is rerouted through skill adapters). Real adapters are stubbed in Phase 1 (canned envelopes for runtime-loop validation); they get filled in with real Composio / OS-permission code in Phase 2. The **only callers** of this skill, now and in the future, are the **Pydantic AI consent-request agent** (drafts replies for inbound consent) and the **LangGraph main chat agent** (responds to the owner directly). Communication / channel agents (call, WhatsApp, etc.) do **not** call this skill directly — when they need user data, they go through one of these two agents.
 >
 > **Governing principle:** the brain reasons, the skill executes, the runtime coordinates. The skill is a thin pipe — no LLM inside. Every retrieval source — third-party, device, or future internal — exposes the same contract so the brain has one decision tree for every fetch.
 
@@ -67,19 +67,26 @@ Phase 1 introduces a deliberate separation between two orthogonal axes that prev
 
 The structural contract treats all origins identically from the brain's perspective at the envelope and permission-flow layer; the implementation differs only inside each per-source adapter.
 
-### 1.4 Two Callers Today, Any Agent Tomorrow
+### 1.4 Two Callers, Two Different Runtimes — Skill Is Runtime-Agnostic
 
-The Information Retrieval Skill is currently consumed by exactly two agents:
+The Information Retrieval Skill has exactly two callers, and they use **different agent frameworks**. The skill is designed runtime-agnostic so each consumes it natively without forcing a framework migration.
 
-- **Consent-request agent** — drafts a reply on the consent screen when an inbound consent arrives.
-- **Main chat agent** — responds to the owner in the chat stream.
+| Agent | Framework | How it calls the skill |
+|---|---|---|
+| **Main chat agent** | LangGraph | Brain emits structured tool calls; LangGraph dispatches via `ToolNode`; envelopes return through the agentic loop; device sources use LangGraph's `interrupt()`. |
+| **Consent-request agent** | Pydantic AI | Existing analyzer LLM call decides which data sources are needed; the consent service calls the skill's adapter functions **directly as plain Python**, gets envelopes back, branches on `status`; the existing draft-compose LLM call produces the reply. **No LangGraph in the consent path** in this milestone. |
 
-Both call the skill identically. Their differences live entirely in:
-- **Trigger** (inbound consent vs chat message).
-- **Channel** for rendering the final answer (consent-screen draft vs chat stream).
-- **Channel** for rendering "needs connection" / "needs permission" prompts.
+Both consume the same envelope, the same `PermissionFlow`, the same `CATEGORY_REGISTRY`, the same per-source adapters. The skill's adapters are **plain Python functions returning typed envelopes** — they're framework-agnostic. LangGraph wraps them with `@tool` for the main agent's tool-calling loop. The Pydantic AI consent-request agent calls the same functions directly when its analyzer outputs a list of needed data sources. Adding a third runtime later (or migrating consent-request to LangGraph in a future phase) wouldn't require changes inside the skill.
 
-**The skill's caller set is closed.** Communication / channel agents (call agent, WhatsApp agent, and any other future channel agent) do not invoke the Information Retrieval Skill directly. When they need user data they go through the consent-request agent or the main chat agent. The skill's design boundary is owner-context retrieval driven by an agent that has the owner's full conversational state — channel agents operate with channel-bound context (a live call, a WhatsApp thread) and exposing them to retrieval would broaden the trust surface and pull channel-specific concerns (voice TTFB budgets, SMS message-length constraints) into a contract that should stay channel-agnostic.
+**Why the consent-request agent stays on Pydantic AI in this milestone:**
+- The current consent flow ships and works. Its real pain point is *what data it can fetch* (Google-only, hardcoded RN-side fetchers, no support for new third-party sources) — addressed by routing fetches through the new skill adapters. The agent's framework choice isn't the bottleneck.
+- A framework swap (Pydantic AI → LangGraph) for the consent-request would be substantial rewrite cost without a current product gain.
+- Pydantic AI is well-suited to the consent-request shape (structured analyzer + draft-compose). Standardizing on LangGraph just for runtime uniformity would be over-engineering.
+- A future phase can migrate or re-architect the consent-request agent if iterative drill-down (search → narrow → fetch full body for drafting) becomes a real need. The skill's contract would not change.
+
+**Device-source path on the consent side:** the skill's device adapters return `needs_device_permission` envelopes when called from the consent path; the consent service relays the request to the React Native app via the existing fetch-on-device pattern (today's `informationConsentService.ts` flow); RN performs the OS-permission read; the result is delivered back to the consent service. The LangGraph `interrupt()` mechanism is **not** used in the consent path — that primitive is LangGraph-specific and lives only in the main agent's runtime. The two paths converge on the same envelope shape; their orchestration mechanics differ.
+
+**The skill's caller set is closed at these two.** Communication / channel agents (call agent, WhatsApp agent, and any other future channel agent) do not invoke the Information Retrieval Skill directly. When they need user data they go through the consent-request agent or the main chat agent. The skill's design boundary is owner-context retrieval driven by an agent that has the owner's full conversational state — channel agents operate with channel-bound context (a live call, a WhatsApp thread) and exposing them to retrieval would broaden the trust surface and pull channel-specific concerns into a contract that should stay channel-agnostic.
 
 ### 1.5 Hard Constraints (Inherited)
 
@@ -219,36 +226,49 @@ envelope.status = "error"
      user to provide info manually
 ```
 
-### 2.6 Consent-Request Agent — Concrete Walk
+### 2.6 Consent-Request Agent — Concrete Walk (Pydantic AI)
 
 ```
 Trigger: inbound consent arrives. Owner opens consent screen.
-         Consent-request agent run starts on the LangGraph runtime.
+         Consent-request flow runs on the existing Pydantic AI orchestration.
 
-System prompt: capability map + envelope spec + consent-specific framing
-               (caller, channel, request, the agent's job: produce a draft).
+Step 1 — Analyzer (Pydantic AI agent, existing):
+  Inputs: caller, request, channel, conversation context.
+  Output (structured Pydantic model):
+    {
+      data_sources_needed: ["gmail", "googlecontacts"],
+      information_retrieval_prompt: "find recent emails from Sharma
+                                     about the deployment",
+      ...
+    }
 
-Iteration 1:
-  Brain → tool_call(gmail_search_emails,
-                    {query: "from:sharma subject:deployment after:...",
-                     max_results: 10})
-  Runtime → adapter.check_availability → "available"
-  Adapter → Composio → Gmail → 3 email metas
-  Envelope returned: {status: "ok", data: [3 metas]}
+Step 2 — Consent service iterates over data_sources_needed:
+  For each source_key returned by the analyzer:
+    envelope = skill.adapter(source_key).extract(params, state)
+    # — plain Python call into the skill's per-source adapter
+    # — same adapter that LangGraph @tool-wraps for the main agent
+    branch on envelope.status:
+      "ok"                          → collect envelope.data
+      "needs_connection"            → surface connect banner on consent screen
+                                       using envelope.permission_flow
+      "needs_device_permission"     → relay to RN via existing on-device fetch
+                                       pattern (no LangGraph interrupt here);
+                                       RN performs OS read, posts back, service
+                                       merges the result into the data set
+      "error" (retryable=true)      → retry once
+      "error" (retryable=false)     → drop this source from the data set; the
+                                       draft will be composed without it
 
-Iteration 2:
-  Brain reads metas, decides 2 are relevant.
-  Brain → tool_call(gmail_get_thread, {thread_id: "..."})
-       → tool_call(gmail_get_thread, {thread_id: "..."})  [parallel]
-  Runtime dispatches both. Two envelopes return with full bodies.
+Step 3 — Draft-compose (Pydantic AI agent, existing):
+  Inputs: information_retrieval_prompt, collected envelope data.
+  Output: structured draft reply text.
 
-Iteration 3:
-  Brain has enough.
-  Brain → final_answer = the DRAFT REPLY TEXT.
-
-Run ends. Runtime persists the draft. Consent screen renders it for the
-owner to review, edit, approve, send.
+Consent screen renders the draft for the owner to review, edit, approve, send.
 ```
+
+**What's unchanged from today:** the analyzer agent, the draft-compose agent, the order of operations (analyze → fetch → compose), the consent screen UX (banners and modals), the RN-side device fetch pattern, the structured-output shape of the agents.
+
+**What's new:** the per-source fetch step now calls the skill's runtime-agnostic adapters instead of hardcoded `GoogleAccountManager` / `/google/*` routes; the response shape is the uniform envelope; "needs_connection" cases use the skill's `PermissionFlow` to drive the connect banner via Phase 2's connect endpoint.
 
 ### 2.7 Main Chat Agent — Concrete Walk
 
@@ -328,19 +348,23 @@ Adapter wraps it and returns envelope: {status: "ok", data: EventList[...]}.
 Brain receives the envelope on the next iteration. Continues normally.
 ```
 
-### 2.10 Migration: From Today's Procedural Consent Flow
+### 2.10 Migration: Consent Flow Plumbing Reroute (Architecture Preserved)
 
-The existing consent flow gets replaced wholesale:
+The consent flow's **agent architecture is preserved**. Only the data-fetch plumbing reroutes through the new skill adapters. The Pydantic AI agents stay; the order of operations stays; the consent screen UX stays.
 
-| Today (procedural) | Phase 2 (agentic) |
-|---|---|
-| `information_retrieval_analyzer.py` runs a one-shot LLM call to decide which data sources are needed | Replaced by the consent-request agent's planner reading the user's request inside the loop |
-| Consent screen on RN calls `fetchDeviceCalendar`, `fetchGoogleCalendar`, `fetchContacts` directly with hardcoded per-source code paths | All data fetching moves server-side. RN's role on the consent screen is read-only display + interrupt-response posting |
-| Backend `/draft-consent-response` endpoint receives data + prompt and returns draft | Replaced by the consent-request agent emitting its final answer = the draft text |
-| Per-source error handling scattered across RN code | Uniform envelope handling in the brain's decision tree |
-| Adding a new data source requires new RN fetcher + new backend route + analyzer prompt change | Adding a new source is a new adapter + new `@tool` + capability map row |
+| What | Today | Phase 2 |
+|---|---|---|
+| Pydantic AI analyzer agent (decides `data_sources_needed`) | Same | **Unchanged** |
+| Pydantic AI draft-compose agent (produces draft text) | Same | **Unchanged** |
+| Order: analyze → fetch → compose | Same | **Unchanged** |
+| Consent screen UX (banners, draft area, modals) | Same | **Unchanged** |
+| Server-side third-party data fetch | `GoogleAccountManager` → `/google/calendar/{userId}` etc. (custom Google routes) | Consent service calls the skill's adapter functions directly: `gmail_search_emails(...)`, `calendar_list_events(...)`. Returns the uniform envelope. |
+| RN-side device data fetch | `fetchDeviceCalendar`, `fetchContacts` etc. with ad-hoc code paths | RN-side fetch pattern unchanged in shape; consent service relays a "needs device data" step (same as today) when an adapter returns `needs_device_permission` |
+| Connection state read | `user_profiles.settings_jsonb.google` | `user_data_source_connections` table (Phase 2) |
+| "Connect Google" banner | Hardcoded for Google, via custom OAuth | Generic "Connect [Provider]" banner driven by `permission_flow.resolution` from any adapter's envelope |
+| Adding a new data source | New RN fetcher + new backend route + analyzer prompt change | Add a new adapter + a row in `CATEGORY_REGISTRY` + the slug to the analyzer's allowed list. **No agent framework changes.** |
 
-The migration is significant but well-bounded — Phase 2 owns it.
+**This is a plumbing migration, not an architecture migration.** Smaller scope, lower risk. The framework decision (Pydantic AI vs LangGraph for the consent-request) is deferred to a future phase if and when iterative drill-down becomes a product need.
 
 ---
 
@@ -685,7 +709,9 @@ trybot-api/app/agentic_mvp/skills/information_retrieval/
 
 Each `@tool` body in `tools.py` is one-liner: instantiate the right adapter, call its four methods, return the envelope. All source-specific logic lives in `adapters/<source>.py`.
 
-### 3.5 Runtime Coordination — Where LangGraph Sits
+### 3.5 Runtime Coordination — Where LangGraph Sits (Main Agent Only)
+
+> **Scope of this section:** the **main chat agent's** runtime. LangGraph is the framework for the main agent. The consent-request agent runs on **Pydantic AI** (existing) and does not use LangGraph; its consumption of the skill is described in §3.7.1 below.
 
 | LangGraph capability | What this phase uses it for |
 |---|---|
@@ -726,14 +752,7 @@ INFORMATION_RETRIEVAL_TOOLS = [
     internal_transcript_search,
 ]
 
-# Each agent's graph binds these:
-consent_request_agent_graph = create_react_agent(
-    model=chat_model,
-    tools=INFORMATION_RETRIEVAL_TOOLS,
-    state_schema=...,
-    checkpointer=postgres_checkpointer,
-)
-
+# The main chat agent's LangGraph graph binds these as @tool functions:
 main_chat_agent_graph = create_react_agent(
     model=chat_model,
     tools=INFORMATION_RETRIEVAL_TOOLS,
@@ -742,7 +761,58 @@ main_chat_agent_graph = create_react_agent(
 )
 ```
 
-Same tool list, two graphs, two different system prompts. The runtime's tool registry is identical for both.
+The same Python functions are imported by the consent-request flow and called directly (without `@tool` wrapping) — see §3.7.1 below.
+
+### 3.7.1 Consent-Request Agent (Pydantic AI) — How It Consumes the Skill
+
+The consent-request agent runs on Pydantic AI, not LangGraph. It consumes the skill by importing the same adapter functions and calling them as plain Python:
+
+```python
+# In the consent service, after the Pydantic AI analyzer returns
+# data_sources_needed:
+
+from app.skills.information_retrieval.tools import (
+    gmail_search_emails, gmail_get_thread,
+    calendar_list_events,
+    contacts_search,
+    device_calendar_read, device_contacts_search,
+    device_request_otp,
+)
+
+ADAPTER_BY_SOURCE = {
+    "gmail":            gmail_search_emails,
+    "googlecalendar":   calendar_list_events,
+    "googlecontacts":   contacts_search,
+    "device_calendar":  device_calendar_read,
+    "device_contacts":  device_contacts_search,
+    "device_otp":       device_request_otp,
+}
+
+collected = {}
+for source_key in analyzer_output.data_sources_needed:
+    fetch = ADAPTER_BY_SOURCE.get(source_key)
+    if not fetch:
+        continue
+    envelope = fetch(...params built from the analyzer's prompt..., state=...)
+    if envelope.status == "ok":
+        collected[source_key] = envelope.data
+    elif envelope.status == "needs_connection":
+        # surface connect banner on consent screen using envelope.permission_flow
+        ...
+    elif envelope.status == "needs_device_permission":
+        # relay to RN via existing on-device fetch pattern (no LangGraph
+        # interrupt here); RN performs the OS read, posts back, service
+        # injects the result into `collected`
+        ...
+    elif envelope.status == "error":
+        # branch on retryable / error_type
+        ...
+
+# Pydantic AI draft-compose agent then runs with `collected` and the
+# information_retrieval_prompt to produce the draft text.
+```
+
+The skill's adapter functions are framework-agnostic. Same code, two consumers: LangGraph wraps them with `@tool` for the main agent's loop; the consent flow imports them and calls them directly.
 
 ### 3.8 Marketplace Composio Adapter Migration
 
@@ -752,18 +822,19 @@ The existing `marketplace_composio.py` (raw `httpx` for Slack/Notion/Linear/GitH
 - Keep the `_SKILL_TO_COMPOSIO` mapping intact — only the execution method changes.
 - Unifies all Composio interactions under one SDK and one credential-lookup convention.
 
-### 3.9 Consent Flow Migration
+### 3.9 Consent Flow Plumbing Reroute (Phase 2 Scope)
 
-The procedural consent flow gets replaced by an agentic loop:
+The consent flow's agent architecture is preserved. Only the data-fetch plumbing reroutes through the new skill adapters.
 
-| Today's piece | Phase 2 replacement |
+| Today's piece | Phase 2 |
 |---|---|
-| `information_retrieval_analyzer.py` (one-shot LLM analyzer) | Removed. The consent-request agent's planner does this reasoning inside the loop. |
-| `informationConsentService.ts` `fetchDeviceCalendar` / `fetchGoogleCalendar` / `fetchContacts` (RN-side procedural fetches) | Removed. RN's only role is rendering the consent screen and posting back to `/api/runs/{id}/resume` for device-source interrupts. |
-| Backend `/draft-consent-response` endpoint | Removed. The consent-request agent emits the draft as its final answer. |
-| Hardcoded per-source UI banners | Replaced by uniform `prompt_payload`-driven rendering. |
+| `information_retrieval_analyzer.py` (Pydantic AI analyzer agent) | **Unchanged.** Continues to output `data_sources_needed`. |
+| Pydantic AI draft-compose agent / `/draft-consent-response` endpoint | **Unchanged.** Continues to receive prompt + collected data and produce draft text. |
+| `GoogleAccountManager` (RN-side) → `/google/calendar/{userId}` etc. (custom Google routes, backend) | **Replaced.** Server-side consent service iterates over `data_sources_needed` and calls the skill's adapter functions directly. Custom Google routes are removed (Phase 2 backend cleanup). |
+| `informationConsentService.ts` device fetches (`fetchDeviceCalendar`, `fetchContacts`) | **Pattern preserved.** When an adapter returns `needs_device_permission`, the consent service relays to RN via the existing on-device fetch flow; RN posts back; service injects result into the collected data. No LangGraph `interrupt()` in the consent path. |
+| Hardcoded "Connect Google" banner | **Replaced.** Generic "Connect [Provider]" banner driven by `permission_flow.resolution` from any adapter's envelope. |
 
-The consent screen's UI surface stays — it still shows the draft, the connect banners, the device-permission modals. What changes is what's behind those surfaces: a LangGraph agent run instead of three separate RN code paths.
+The consent screen's UI surface stays. The Pydantic AI agents stay. Only the data plumbing changes.
 
 ### 3.10 What Phase 1 Hands Off to Phase 2
 
@@ -774,7 +845,7 @@ Phase 2 cannot ship without Phase 1's contracts in place. Phase 1 produces the f
 - **The `CATEGORY_REGISTRY`** — Phase 2 ensures each `CategorySource` entry maps to a working adapter.
 - **The `DataSourceAdapter` base class** with the four-method contract (`check_availability`, `build_prompt_payload`, `extract`, `wrap_result`) — Phase 2's per-source adapters subclass it.
 - **The `@tool` registration mechanism** with the LangGraph runtime — Phase 2's adapters wire into this.
-- **The `interrupt()` resume endpoint** (`POST /api/runs/{run_id}/resume`) — Phase 2's device adapters use it; React Native posts results to it.
+- **The `interrupt()` resume endpoint** (`POST /api/runs/{run_id}/resume`) — Phase 2's device adapters use it; React Native posts results to it. **Auth: JWT (the same `get_authenticated_user` dependency used elsewhere)** — the user's own RN app posts the resume payload, so JWT both proves identity and gates access to the run.
 - **The capability-map renderer** — Phase 2's category additions automatically flow into the rendered system-prompt section.
 - **Stub adapters** that return canned envelopes — Phase 2 replaces them with real Composio calls and device interrupts. The runtime loop is end-to-end validated against the stubs in Phase 1, so Phase 2's risk is contained to per-source integration work, not contract debugging.
 
@@ -807,10 +878,10 @@ Phase 1 is contract + runtime + stubs. Real adapters are out of scope here.
 | Implement capability-map renderer (system-prompt section generated from registry) | 1 |
 | Build stub adapters for every v1 source returning canned envelopes (so the runtime loop runs end-to-end) | 2 |
 | Wire `@tool` functions delegating to (stub) adapters; register with LangGraph runtime | 1 |
-| FastAPI `/api/runs/{run_id}/resume` endpoint for `interrupt()` resume; round-trip test with a stub device adapter | 2 |
+| FastAPI `/api/runs/{run_id}/resume` endpoint for `interrupt()` resume (JWT-authenticated via `get_authenticated_user`, same as the rest of the user-facing API); round-trip test with a stub device adapter | 2 |
 | Consent-request agent: define graph + system prompt; validate run loop with stub envelopes producing a stub draft | 2 |
 | Main chat agent: integrate stub tools into existing graph; validate run loop | 1.5 |
-| Define migration plan for the existing procedural consent flow (executed in Phase 2) | 0.5 |
+| Define plumbing-reroute plan for the existing Pydantic AI consent flow (executed in Phase 2; agent architecture preserved) | 0.5 |
 | Unit tests across envelope shape, permission-flow union, category registry, adapter base, runtime registration, interrupt round-trip | 2.5 |
 | **Phase 1 Total** | **~16 hours / ~2 days** |
 
@@ -825,16 +896,16 @@ For sequencing context. Detailed in `phase-2-integration.md`.
 | `DEVICE_DATA_SOURCES` registry wiring with `permissionService.ts` mapping | 1 |
 | FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled) | 6.5 |
 | Real adapters replacing Phase 1 stubs: gmail, googlecalendar, googlecontacts | 4.5 |
-| Real adapters: device_calendar, device_contacts, device_otp, device_location (interrupt → RN execution) | 6 |
+| Real adapters: device_calendar, device_contacts, device_otp, device_location — main agent path uses `interrupt()` → RN; consent agent path uses existing RN device-fetch flow (same envelope shape, two orchestrations) | 6 |
 | `marketplace_composio.py` migration to Composio SDK + read from `connected_data_sources` dict | 1.5 |
 | Backend Google cleanup (remove `google_service.py`, `google_api_client.py`, `google_user_profile_service.py`, `token_encryption.py` (Google paths), `routes/google.py`) | 4 |
 | RN integration: `react-native-inappbrowser-reborn`, `trybo://` scheme on iOS/Android, deep-link router | 4 |
 | RN: ConnectedDataSourcesCard + ConnectedDataSourcesScreen + Redux slice + dataSourceService.ts | 5 |
-| Consent flow migration: remove `information_retrieval_analyzer.py`, `/draft-consent-response`, RN procedural fetches; rewire to agent | 5 |
-| End-to-end device testing (Android + iOS) — connect / disconnect / reconnect / fetch / interrupt | 9 |
-| **Phase 2 Total** | **~48 hours / ~6 days** |
+| Consent flow plumbing reroute: replace `GoogleAccountManager`/`/google/*` calls with skill adapter calls; wire `permission_flow`-driven generic connect banner; keep analyzer + draft-compose agents and RN device fetch flow intact | 2 |
+| End-to-end device testing (Android + iOS) — connect / disconnect / reconnect / fetch / interrupt + consent flow with new plumbing | 9 |
+| **Phase 2 Total** | **~45 hours / ~5.5 days** |
 
-Combined milestone (Phase 1 + Phase 2): **~64 hours / ~8 days**.
+Combined milestone (Phase 1 + Phase 2): **~61 hours / ~7.5 days**.
 
 ### 3.14 What This Whole Milestone Explicitly Defers (Phase 1 + Phase 2 Combined)
 

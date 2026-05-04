@@ -2,7 +2,7 @@
 
 > **Milestone:** M1 — Information Retrieval Skill (Owner: KPR). See `gtm-milestone-plan.md` for the milestone-level demo and beta total.
 >
-> **This is Phase 2 of two.** Phase 1 (`phase-1-structurization.md`) defines the contract — the category registry, the capability bundle, the uniform response envelope, the unified permission flow, the per-source adapter base class, and the runtime coordination — with **stub adapters** validating the agent run loop end-to-end. Phase 2 *fills in real integrations against that contract* — Composio third-party, device-level OS permissions, OAuth + deep-link plumbing, the React Native management surface, the migration of the existing custom Google data-access stack, the migration of the raw-`httpx` Composio adapter to the SDK, and the migration of the procedural consent flow to the new agentic pattern.
+> **This is Phase 2 of two.** Phase 1 (`phase-1-structurization.md`) defines the contract — the category registry, the capability bundle, the uniform response envelope, the unified permission flow, the per-source adapter base class, and the runtime coordination — with **stub adapters** validating the agent run loop end-to-end. Phase 2 *fills in real integrations against that contract* — Composio third-party, device-level OS permissions, OAuth + deep-link plumbing, the React Native management surface, the removal of the existing custom Google data-access stack, the migration of the raw-`httpx` Composio adapter to the SDK, and a **plumbing reroute** of the existing Pydantic AI consent flow so its data fetches go through the new skill adapters (the consent flow's agent architecture is preserved — no Pydantic AI → LangGraph framework swap in this milestone).
 >
 > **Scope of this document:** the integration layer that fills Phase 1's adapter interfaces with real code — for two categories, **third-party** (Gmail / Google Calendar / Google Contacts via Composio) and **device-level** (calendar / contacts / OTP / location via OS permissions). Internal / database sources (transcripts, summaries via vector DB) are out of scope and will arrive in a future milestone.
 >
@@ -116,9 +116,9 @@ The unified Information Retrieval Skill will, in a later phase, expose a single 
 | Whether the source is available, connected, expired, or missing | Skill — by reading the Data Source Registry + connection-state table |
 | What to do when a source is needed but not connected (surface a connect prompt, ask the user manually, retry later) | Agent — it owns the chat-side UX |
 | Performing the OAuth handshake, persisting connection state, revoking, surfacing the deep-link return | Skill (this milestone) |
-| Reading data from a connected source | Skill (deferred fetch phase) |
-| Per-source error semantics (expired vs rate-limited vs outage) | Skill (deferred fetch phase) |
-| Retry / fallback policy on those errors | Agent (deferred fetch phase) |
+| Reading data from a connected source | Skill (Phase 2) |
+| Per-source error semantics (expired vs rate-limited vs outage) | Skill (Phase 2) |
+| Retry / fallback policy on those errors | Agent (Phase 2) |
 
 Crisp principle: **the agent is the brain, the skill is a thin pipe**. The skill never embeds an LLM of its own; the agent's planner has all the reasoning. The skill simply exposes connection state and (later) executes structured fetch calls the agent has already chosen.
 
@@ -173,7 +173,7 @@ This makes one endpoint serve all three cases: fresh connect, expired reconnect,
 - **Profile screen:** a new **Connected Data Sources** card replaces the existing Google card. The card shows a brief summary (e.g., a count of currently-connected sources). Tapping it opens a dedicated screen.
 - **Connected Data Sources screen:** lists every row from the user's `user_data_source_connections`. Each `active` row has a Disconnect button. Each `expired` row has a Reconnect button. **There is no Connect button on this screen** — new connections are initiated only by the agent in context.
 - **Chat UI:** unchanged in M1. The agent's "Connect [Provider]" prompts are an agent-side UX concern handled outside this milestone.
-- **Consent screen:** the existing rewire is mechanical — calls that used to fetch Google data through the frontend account-manager helper now go through the backend's data-source surface (the backend fetch endpoint is deferred, so M1 leaves these call sites stubbed until the fetch phase ships).
+- **Consent screen:** the existing rewire is mechanical — calls that used to fetch Google data through the frontend account-manager helper now go through the backend's data-source surface. The Pydantic AI consent agent's analyzer + draft-compose stages stay; only the per-source fetch step inside the consent service swaps to call the new skill adapter functions directly.
 
 ### 2.8 What the Agent Sees
 
@@ -181,7 +181,7 @@ This makes one endpoint serve all three cases: fresh connect, expired reconnect,
 
 ### 2.9 The Two Surfaces of Data Access (Future Tension)
 
-Third-party flows are server-side; device flows are client-side. The fetch phase will need a single skill contract that bridges both — likely via a LangGraph interrupt pattern where device-source requests pause the run, instruct the app to perform the read, then resume on result delivery. **M1 does not solve this**; it is named here so the deferred design has a clear pointer.
+Third-party flows are server-side; device flows are client-side. M1 bridges this with **two orchestration mechanisms** behind one envelope contract: the **main agent (LangGraph)** uses `interrupt()` for device sources — it pauses the run, surfaces the request to React Native, RN performs the read, the run resumes; the **consent agent (Pydantic AI)** continues to use the existing on-device fetch flow — when an adapter returns `needs_device_permission`, the consent service relays the request to RN via the existing pattern, RN performs the read, posts back, the result is injected. The envelope shape is identical for both paths; only the orchestration mechanics differ.
 
 ---
 
@@ -238,7 +238,7 @@ What this formalization does in Phase 1:
 
 What this formalization does NOT do in Phase 1:
 - Does not introduce server-side fetching for device sources (impossible — device data lives on the phone).
-- Does not change the consent flow's current procedural device-data fetches (`fetchDeviceCalendar`, etc.). Those remain operational and are migrated by Phase 2.
+- Does not change the consent flow's current device-data fetches (`fetchDeviceCalendar`, etc.). The consent flow's RN-side device-fetch pattern is **preserved** in Phase 2 — only its third-party fetches reroute through the new skill adapters. The main chat agent uses LangGraph `interrupt()` for device sources.
 - Does not change OS permission prompting behaviour.
 
 **Net effect:** after Phase 1, both `ENABLED_DATA_SOURCES` (third-party slugs) and `DEVICE_DATA_SOURCES` (device entries) coexist as a uniform "registry of reachable sources". Phase 2 builds the agent-skill contract on top of both.
@@ -302,7 +302,7 @@ In `trybot-api/app/agentic_mvp/runtime/contracts.py`, `ExecutionContext` is upda
 | `composio_connected_account_id: Optional[str]` | **removed** — replaced by the dict below |
 | — | `connected_data_sources: dict[str, str]` — `{source_slug: connected_account_id}` |
 
-The existing raw-`httpx` adapter (`marketplace_composio.py`) is migrated to look up account IDs from the dict by toolkit slug **as part of the deferred fetch phase**, not M1. Until that migration ships, that adapter continues to read from the old singular field via a backwards-compat shim local to that file. (M1 keeps the old field as a deprecated alias on `ExecutionContext` until the fetch phase removes it.)
+The existing raw-`httpx` adapter (`marketplace_composio.py`) is migrated in Phase 2 to look up account IDs from the dict by toolkit slug. The migration replaces the raw `httpx` calls with `composio_client.tools.execute(...)` via the SDK, keeps the `_SKILL_TO_COMPOSIO` mapping intact, and reads from `ExecutionContext.connected_data_sources[toolkit_slug]` instead of the old singular `composio_connected_account_id` field. The old singular field is removed from `ExecutionContext` once the migration ships in Phase 2.
 
 ### 3.6 Backend Setup Module
 
@@ -327,7 +327,7 @@ A new service `trybot-api/app/services/data_source_connection_service.py` wraps 
 |---|---|
 | Google data-access account-manager helper | `trybot-ui/lib/GoogleAccountManager.ts` — deleted |
 | Existing Profile-screen Google card | `trybot-ui/components/.../GoogleIntegrationCard.tsx` — deleted (replaced by Connected Data Sources card) |
-| Direct calls to `GoogleAccountManager.getCalendarEvents()` / `searchContactsByPhone()` in the consent service | `trybot-ui/services/informationConsentService.ts` — rewired to call the new backend data-source endpoints (which become live in the deferred fetch phase; M1 leaves these as stubbed paths) |
+| Direct calls to `GoogleAccountManager.getCalendarEvents()` / `searchContactsByPhone()` in the consent service | Replaced. The consent service (server-side) calls the new skill adapter functions directly: `gmail_search_emails(...)`, `calendar_list_events(...)`, `contacts_search(...)`. The Pydantic AI analyzer + draft-compose agents are unchanged; only the per-source fetch step swaps from `GoogleAccountManager` / `/google/*` to skill adapters. |
 
 ### 3.9 Frontend — Preserved (Out of Scope)
 
@@ -373,27 +373,35 @@ The following are part of the broader Information Retrieval Skill but **not** in
 
 All implementation is done with Claude. Claude writes code and unit tests. Human time is for device verification, OAuth/Composio dashboard configuration, and on-device testing. Working day = 8 hours.
 
-| Phase | In M1? | Hours | Days |
-|---|---|---|---|
-| **P1** — Composio Python SDK setup + DB migration + connection service wrapper | ✅ | 4.75 | 0.6 |
-| **P2** — FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled) + unit tests | ✅ | 6.5 | 0.8 |
-| **P3** — Generic data-fetch service + migrate `marketplace_composio.py` to SDK | ❌ deferred | — | — |
-| **P4** — Backend Google cleanup (remove custom-OAuth Google data-access stack) | ✅ | 4.25 | 0.5 |
-| **P5** — RN integration (in-app browser dep, `trybo://` scheme, deep-link router, Profile-card replacement, Connected Data Sources screen, consent rewire stubs) | ✅ | 15 | 1.9 |
-| **P6** — LangGraph agent awareness + planner-prompt updates + fetch-skill registration | ❌ deferred | — | — |
-| End-to-end device testing on Android + iOS for the connect / disconnect / reconnect / deep-link / browser-return flows | ✅ | 9 | 1.1 |
-| **M1 Total** | | **39.5 hours** | **~5 days** |
+This is the **Phase 2 (Integration)** task list. Phase 1 (Structurization) tasks are detailed in `phase-1-structurization.md` §3.12.
 
-> Deferred items (P3 + P6) move to the **Data Source Fetch** component, which depends on M1 being live. Combined deferred budget is ~13.5 hours / ~1.7 days; that's the next ticket, not M1.
+| Task | Hours |
+|---|---|
+| Composio SDK setup, env wiring | 0.5 |
+| Supabase migration: `user_data_source_connections` + RLS | 1 |
+| `ENABLED_DATA_SOURCES` real list + `DEVICE_DATA_SOURCES` registry wired to `permissionService.ts` | 1 |
+| FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled) + unit tests | 6.5 |
+| Real adapters replacing Phase 1 stubs — third-party: gmail, googlecalendar, googlecontacts (Composio-backed) | 4.5 |
+| Real adapters replacing Phase 1 stubs — device: device_calendar, device_contacts, device_otp, device_location. Main agent path uses LangGraph `interrupt()` → RN; consent agent path uses existing on-device fetch flow (same envelope shape, two orchestrations) | 6 |
+| Backend Google cleanup (remove `google_service.py`, `google_api_client.py`, `google_user_profile_service.py`, `token_encryption.py` Google paths, `routes/google.py`) | 4 |
+| `marketplace_composio.py` migration: raw `httpx` → Composio SDK + read from `connected_data_sources` dict | 1.5 |
+| RN integration: `react-native-inappbrowser-reborn`, `trybo://` scheme on iOS/Android, deep-link router | 4 |
+| RN: ConnectedDataSourcesCard + ConnectedDataSourcesScreen + Redux slice + dataSourceService.ts | 5 |
+| Consent flow plumbing reroute: replace `GoogleAccountManager`/`/google/*` calls with skill adapter calls inside the consent service; wire `permission_flow`-driven generic connect banner; Pydantic AI analyzer + draft-compose agents and RN device-fetch flow remain unchanged | 2 |
+| End-to-end device testing on Android + iOS — connect / disconnect / reconnect / fetch / interrupt flows + consent flow with new plumbing | 9 |
+| **Phase 2 Total** | **~45 hours / ~5.5 days** |
+
+Combined milestone (Phase 1 + Phase 2): **~61 hours / ~7.5 days**.
 
 **Recommended execution order:**
-- Day 1: P1 → start P2.
-- Day 2: finish P2 → start P4.
-- Day 3: finish P4 → start P5 (deep-link scaffolding + in-app browser dependency).
-- Day 4: P5 (Profile card replacement, Connected Data Sources screen, consent rewire stubs).
-- Day 5: end-to-end device testing on Android + iOS for the full connect / disconnect / reconnect / deep-link return loop.
+- Day 1: SDK setup + DB migration + connection endpoints (start).
+- Day 2: Connection endpoints (finish) + start replacing stubs with real third-party adapters.
+- Day 3: Finish third-party adapters + start device adapters.
+- Day 4: Device adapters + backend Google cleanup + marketplace_composio migration.
+- Day 5: RN integration (browser + deep-link + Profile card + screen) + consent flow plumbing reroute.
+- Day 5–6: End-to-end device testing on Android + iOS.
 
-Critical path: P1 → P2 → P5. P4 runs alongside P5 once P2 is done.
+Critical path: connection endpoints → real third-party adapters → RN integration. Device adapters and consent flow plumbing reroute can run in parallel once endpoints land.
 
 ---
 
@@ -437,11 +445,11 @@ Disconnect deletes the row outright. Row absence already means "not connected." 
 
 ### 4.10 Why a dict on `ExecutionContext` instead of a single account ID?
 
-A single user can have many simultaneous third-party connections (Gmail and Calendar and Contacts, each with its own `connected_account_id`). One singular field can't carry all three. The dict is the natural shape and scales to any future enabled source without further schema changes. The existing raw-`httpx` adapter migrates to read from this dict in the deferred fetch phase.
+A single user can have many simultaneous third-party connections (Gmail and Calendar and Contacts, each with its own `connected_account_id`). One singular field can't carry all three. The dict is the natural shape and scales to any future enabled source without further schema changes. The existing raw-`httpx` adapter migrates to read from this dict in Phase 2.
 
 ### 4.11 Why does the agent decide which source to call (dumb skill), not the skill (smart skill)?
 
-A smart skill that embeds its own LLM call to pick sources duplicates work the agent's planner is already paying for — two LLM hops instead of one, twice the latency, twice the cost. It also blinds the agent to the choice (the agent can't recover when the skill picks the wrong source). LangGraph's strength is structured tool calls with typed parameters; the cleanest pattern is a thin skill the agent calls with a fully-formed intent. M1 sets up `connected_data_sources` so the agent's planner has the visibility it needs; the skill's contract gets defined in the deferred fetch phase, but the architectural commitment to "agent reasons, skill executes" is made here.
+A smart skill that embeds its own LLM call to pick sources duplicates work the agent's planner is already paying for — two LLM hops instead of one, twice the latency, twice the cost. It also blinds the agent to the choice (the agent can't recover when the skill picks the wrong source). LangGraph's strength is structured tool calls with typed parameters; the cleanest pattern is a thin skill the agent calls with a fully-formed intent. M1 Phase 1 defines `connected_data_sources` and the dumb-skill contract; M1 Phase 2 fills in the real adapters and wires both agents to consume them. The architectural commitment is "agent reasons, skill executes" across both phases.
 
 ### 4.12 Why an in-app browser instead of `Linking.openURL` + system browser?
 
@@ -473,7 +481,7 @@ All third-party connections stop: connect, disconnect, status check, fetch (when
 
 ### 4.19 What's the failure mode if a token expires silently?
 
-In M1, the row says `active` until something tries to use it and fails. M1 doesn't fetch (fetch is deferred), so there's no path that flips a row to `expired` during M1. Once the fetch phase ships, an auth-error during fetch flips the row to `expired`, the UI reflects "Reconnect", and the agent treats the source as unavailable until the user reconnects. This is acceptable because the worst case is "one wasted fetch attempt before the UI catches up."
+In M1, the row says `active` until something tries to use it and fails. Phase 1 doesn't fetch (only stubs), so the `expired` writer doesn't run yet. Phase 2 ships the real adapters, and the auth-error path inside each adapter's `extract` flips the row to `expired`. The UI then reflects "Reconnect", and the agent treats the source as unavailable until the user reconnects. The worst case is "one wasted fetch attempt before the UI catches up."
 
 ### 4.20 What about provider-side OAuth verification (e.g., Gmail's restricted scopes)?
 
@@ -481,7 +489,7 @@ Custom OAuth — when Trybo's own Google Cloud project requests Gmail read scope
 
 ### 4.21 What about Composio rate limits and cost?
 
-Free tier is 20K calls/month; Starter is $29/month for 200K. M1 itself hardly consumes budget — connections are infrequent, and fetches are deferred. Cost scaling becomes meaningful only once the fetch phase ships and agents are calling Composio per turn, which is a separate budget conversation.
+Free tier is 20K calls/month; Starter is $29/month for 200K. Connection initiations are infrequent (one per user per source). Real cost scaling kicks in once Phase 2 ships and agents are fetching from Composio per turn. For the v1 source set (Gmail, Calendar, Contacts) and the current dev cohort, free tier is comfortable. Monitor as user count grows; switch to Starter when needed.
 
 ### 4.22 What about multiple Google scopes (Gmail vs Calendar vs Contacts)?
 
@@ -489,4 +497,4 @@ Each Composio toolkit (`gmail`, `googlecalendar`, `googlecontacts`) is a separat
 
 ### 4.23 Where does the unified Information Retrieval Skill come together?
 
-M1 builds the third-party connection layer. The deferred Data Source Fetch component builds the skill execution layer (third-party fetches + device-source interrupt pattern + planner-prompt updates). Together they form the Information Retrieval Skill that both the consent-request agent and the main chat agent invoke. Internal-DB sources (transcripts, summaries) plug into the same skill in a later milestone.
+M1 ships in two phases inside one milestone. Phase 1 (Structurization) defines the contract — capability bundle, envelope, `PermissionFlow`, category registry, adapter base class, runtime coordination — with stub adapters validating the loop. Phase 2 (Integration) fills in real adapters (third-party + device), wires the connection layer, removes the legacy custom Google data-access stack, migrates `marketplace_composio.py` to the SDK, ships the RN management surface, and reroutes the consent flow's data plumbing through the skill (without touching the Pydantic AI consent agent itself). Both the Pydantic AI consent-request agent and the LangGraph main chat agent consume the same skill — same envelope, same `PermissionFlow`, same per-source adapters — through their respective tool mechanisms. Internal-DB sources (transcripts, summaries) plug into the same skill in a later milestone when the vector DB ships.
