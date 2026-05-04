@@ -1429,22 +1429,29 @@ Whatever the mobile renders, the backend snapshots. The persisted state is the s
 
 The consent component's existing trust posture — *"each new caller question gets a fresh agent with no memory of prior sessions"* — is preserved by the cleanup rule:
 
-- Agent state persists **for the lifetime of one consent_request only** (open status: `pending` / `in_progress`)
-- Agent state is **deleted immediately** when the consent_request reaches any terminal status (`approved`, `declined`, `expired`, `cancelled`) — same transaction as the status update
+- Agent state persists **for the lifetime of one consent_request only** (open status: `pending`)
+- Agent state is **deleted immediately** when the consent_request reaches any terminal status (`approved`, `declined`, `expired`, `canceled`) — same transaction as the status update, hard delete (no soft-delete, no retention window, no audit archive)
 - A new consent_request always starts with a fresh agent — no cross-consent state leakage
 
-Mid-flow refinements within a single consent_request now share state (which is what enables resumption). Across consent_requests, the trust boundary is intact.
+Mid-flow refinements within a single consent_request now share state (which is what enables resumption). Across consent_requests, the trust boundary is intact. Hard-delete on terminal is a deliberate stance — owner privacy and trust-boundary clarity are valued above audit retention; resolved consent decisions are recorded only by the consent_request row itself, not by the agent's reasoning trail.
 
 ### Snapshot lifecycle
 
 State is written at every meaningful transition in the agent loop, so the owner never loses work — including the case where the agent finishes a draft with no tool calls, the owner closes the screen, then comes back later to refine. Reopening always continues from where the chat was left.
 
-1. **End of every agent iteration** — after each LLM call completes (whether it produced reasoning tokens, a draft, a tool_call, or a `done`). Persists the running `message_history` + UI render state up to this point. This is what gives the consent agent ChatGPT-style continuous memory within a consent flow.
+1. **End of every agent iteration** — after each LLM call completes (whether it produced reasoning tokens, a draft, a tool_call, or a `done`). Persists the running `message_history` + UI render state up to this point. This is what gives the consent agent ChatGPT-style continuous memory within a consent flow. **Applies even to fast no-tool-call flows** — uniform iteration-end snapshotting so reopen always restores prior chat regardless of flow shape.
 2. **Pre-park (tool_call emission)** — right before the agent emits a `tool_call` and the SSE closes for the long wait. Persists `message_history` + the pending tool descriptor + UI render state covering all chat bubbles produced so far.
 3. **Post-resume** — when the agent receives a tool result and continues the loop. Persists the updated `message_history` (now including the tool result) + cleared pending tool entry.
-4. **Terminal** — when the consent_request reaches `approved` / `declined` / `expired` / `cancelled`. The row is deleted in the same transaction as the status update. Cross-consent state never leaks.
+4. **Terminal** — when the consent_request reaches `approved` / `declined` / `expired` / `canceled` (matches the existing schema CHECK constraint — one-`l` spelling). The row is deleted in the same transaction as the status update. Cross-consent state never leaks.
 
 Snapshot writes are small JSONB UPSERTs on a single row, well under 50ms. Within a typical consent flow this is 5-15 writes total — negligible relative to the LLM call cost.
+
+### Concurrency, race policy, and storage details
+
+- **Atomic UPSERT, no explicit row lock.** Snapshots use `INSERT … ON CONFLICT (consent_request_id) DO UPDATE` — a single statement, atomic, idempotent. Last-write-wins is safe because both possible concurrent writers (agent snapshot, `/tool-result` POST handler) always carry the full latest state. Postgres MVCC handles serialization. This matches the LangGraph / Pydantic AI community pattern; pessimistic `SELECT FOR UPDATE` was considered and rejected as unnecessary overhead.
+- **Single JSONB column on a separate table** — `app.consent_agent_state(consent_request_id PK + FK + ON DELETE CASCADE, state jsonb, updated_at)`. Separate from `app.consent_requests` to avoid bloating the audit-grade trust record table with high-frequency runtime writes; single JSONB column to keep schema evolution friction-free as Pydantic AI internals change.
+- **Cleanup is inline-only** — DELETE happens in the same transaction as the consent_request terminal status update, hooked once in `ConsentRequestStore._update_status()` (the single funnel). No background sweep, no Postgres trigger, no scheduled cron. The FK CASCADE handles the rare hard-delete-of-consent_request edge case as a backstop.
+- **RLS: service-role only.** Table has RLS enabled with a single deny policy for the `authenticated` role; service-role bypasses RLS. No user-facing endpoint reads this table directly — mobile receives only the UI-render-state portion through the existing `GET /consent-request/{id}/details` route handler (backend filters out the internal `agent_runtime` half before responding).
 
 ### Mobile app responsibilities (changes from current)
 
@@ -1500,9 +1507,28 @@ The bounded wait + heartbeats from Change 5 stay relevant for the **degenerate c
 | `/agent-turn` route changes: detect pending state, route to fresh-start vs resume path | 4 |
 | Cleanup hook: terminal status → delete state row in same transaction | 2 |
 | Mobile: fetch UI render state on screen open + repaint chat thread + popups | 8 |
-| Feature flag wiring + phased rollout config | 2 |
 | Migration handling for in-flight consents at deploy | 2 |
 | Tests (round-trip, resume, cross-instance, restart simulation, cleanup, trust boundary) | 8 |
 | Observability (state-row count gauge, snapshot/resume duration metrics) | 2 |
 | Documentation updates (master design, anti-patterns) | 2 |
-| **Total** | **~50 hours (~6-7 working days)** |
+| **Total** | **~48 hours (~6 working days)** |
+
+### Locked design reference (decisions captured from design review)
+
+| # | Topic | Final decision |
+|---|---|---|
+| 1 | Storage location | Separate table `app.consent_agent_state` (NOT a column on `consent_requests`). PK + FK + ON DELETE CASCADE to `consent_requests.id`. |
+| 2 | Schema shape | Single `state` JSONB column holding both `agent_runtime` (Pydantic AI `message_history`, pending tool calls, iteration, status, last refinement) and `ui_render_state` (chat_messages, current_steps, current_step_results, current_draft_text, current_agent_message, pending_otp_request, pending_permission_grant). |
+| 3 | Race policy | `INSERT … ON CONFLICT (consent_request_id) DO UPDATE` — atomic UPSERT, last-write-wins. No explicit `SELECT FOR UPDATE`. Both writers always carry full latest state, so MVCC handles serialization. Matches LangGraph / Pydantic AI community pattern. |
+| 4 | Snapshot points | (a) End of every agent iteration — including fast no-tool-call flows. (b) Tool_call emission boundary, immediately before SSE closes. (c) Post-resume after a tool result is received. (d) Terminal status → DELETE the row. |
+| 5 | What is persisted | Verbatim — full `message_history` (including tool results), full UI render state. No scrubbing, no summarization. Pixel-identical reopen contract. |
+| 6 | Cleanup policy | Hard DELETE on terminal status, same transaction as the status UPDATE. Single hook in `ConsentRequestStore._update_status()` (the existing funnel for `mark_approved` / `mark_declined` / `mark_expired`). No soft-delete, no retention window, no audit archive. FK CASCADE handles the rare hard-delete-of-consent_request edge as a backstop. No background sweep. No Postgres trigger. |
+| 7 | Mobile resume signal | `GET /consent-request/{id}/details` returns `agent_state` field (UI portion only). `null` = fresh start; present = repaint and resume. Backend never exposes the internal `agent_runtime` / `message_history` to the client. |
+| 8 | Mobile reopen behavior | Render-only repaint on screen open. Mobile does NOT auto-fire a new `/agent-turn` POST unless the saved state shows a resolved tool result waiting to be processed. Owner action is what drives the next turn. |
+| 9 | Concurrent multi-device collision | Non-issue. Single-device session enforcement (decisions.md #10) means only one device can be authenticated at any moment. No idempotency mechanism needed beyond what naturally falls out. |
+| 10 | RLS | Enabled with `consent_agent_state_deny_authenticated` policy returning `false` for the `authenticated` role. Service-role bypasses RLS. No user-facing endpoint reads this table directly. |
+| 11 | Trust-boundary scoping | Within one consent_request lifetime: state persists across screen close/reopen (mid-flow refinements share state). Across consent_requests: hard isolation (each new consent always gets a fresh agent). |
+| 12 | In-flight consent handling at deploy | Graceful coexistence. Pre-deploy in-flight SSE coroutines run to natural completion under the old behavior (bounded by Change 5's mechanical cap). New consents use the durable resume path. Old code path retired ~24h after deploy once in-flight flows have drained. |
+| 13 | Cross-repo PR coordination | Two PRs on the same branch name, shipping together: backend (`trybot-api`) + mobile (`trybot-ui`). Backend's `agent_state: null` response is graceful-fallback for old mobile builds during the rollout window. |
+| 14 | Status spelling | Use `'canceled'` (single `l`) — matches the existing `app.consent_requests.status` CHECK constraint. |
+| 15 | Composition with Change 5 (mechanical fix) | Both designs coexist. Change 5's bounded wait + heartbeats handle the short-wait happy path where the SSE remains open for fast device responses. Change 6's snapshot-and-close-SSE takes over for any wait that would exceed the in-stream cap. The mechanical fix is the in-stream cap; the architectural fix is what happens beyond it. |
