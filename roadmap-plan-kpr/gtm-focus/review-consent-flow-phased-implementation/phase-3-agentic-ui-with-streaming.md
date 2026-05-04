@@ -1300,3 +1300,79 @@ All new fields are optional with defaults → backend and frontend can be deploy
 | Frontend hook + UI changes | 2 |
 | Testing + prompt tuning | 2 |
 | **Total** | **7** |
+
+---
+
+## Change 5: Tool-Wait Lifecycle (Bounded, Heartbeated, Connection-Light)
+
+**Why this matters:** When the agent emits a `tool_call` and parks waiting for the device's `/tool-result` POST, the wait can be long — owner reaction time + network round-trip — and the SSE stream stays open the whole time. The lifecycle of that parked wait must be designed so a single slow consent flow cannot starve cross-cutting backend resources or mask a closed mobile client.
+
+### Three lifecycle properties
+
+**1. Bounded duration**
+
+Every tool wait has a hard wall-clock cap of **180 seconds (3 minutes)**. If no `/tool-result` arrives within the cap, the wait surfaces a `step` SSE event with `status: "timeout"` and the agent loop continues with a `{status: "timeout"}` placeholder result. 3 minutes covers realistic owner reaction time for the slowest expected case (OTP retrieval — read SMS, switch app, type, submit) plus FCM notification delay and network round-trip, while still releasing resources promptly when the device is genuinely unreachable. The agent treats a timed-out tool the same way it treats a `permission_denied` result: continue drafting with what it has and surface a "couldn't reach the device for X" line in the response.
+
+**2. Periodic heartbeats**
+
+While the wait is parked, the SSE stream emits a no-op keepalive comment at a regular interval. Two purposes:
+- The route layer's disconnect check can only observe a closed mobile client between byte writes. With no writes happening during the park, a closed client would otherwise stay invisible to the server. Heartbeats give the framework that write opportunity, so closed clients are detected within one heartbeat interval.
+- The cancellation flag (set by supersede or `DELETE /agent-turn`) is re-checked each interval, so superseded turns terminate promptly instead of running to the wall-clock cap.
+
+The heartbeat is an SSE comment line (begins with `:`). It is silently ignored by SSE parsers on the client side and is invisible to the agent itself.
+
+**3. Connection lifecycle**
+
+The agent loop does NOT hold a request-pool DB connection across the wait. The route handler acquires a short-lived DB session purely for prep work (consent record lookup, payload extraction), then releases it before the SSE generator starts the agent loop. Any DB work the agent itself needs during a tool execution acquires + releases its own session for that call only — never across a parked wait.
+
+This guarantees the request DB pool is never drained by accumulated parked agents. Unrelated endpoints (chat, scheduled jobs, channel webhooks) keep their fair share of the pool regardless of how many consent screens are currently parked.
+
+### Service-level configuration
+
+The Cloud Run service running the agent endpoint is configured for fast failure and bounded blast radius:
+
+- **Request timeout: 210 seconds** — slightly higher than the agent's own 180s wall-clock cap so the agent's `step: timeout` event always fires first (cleanly) rather than the platform killing the request with a raw 504
+- **Per-instance concurrency: 40** — half the default; limits parked-request count per instance
+- **Minimum instance count: 2** — eliminates cold-start stampede when traffic resumes after a quiet period
+- **Maximum instance count: 20** — bounds total fleet damage from any runaway loop
+
+### Outcome
+
+A single misbehaving consent flow can never:
+- Hang past the wall-clock cap
+- Hold backend resources past the heartbeat interval after a client disconnect
+- Drain the request DB pool
+
+Unrelated endpoints (chat list, scheduled jobs, channel webhooks) remain available regardless of consent agent state. Resource consumption per parked agent is predictable and bounded.
+
+### What this design does NOT include
+
+Cross-instance wakeup coordination is intentionally out of scope. Today's wakeup signal (the `asyncio.Event` in `loop_state.pending_tool_calls`) is per-process. A `/tool-result` POST that lands on a different Cloud Run instance than the parked agent will return 404, and that wait will close on the wall-clock cap rather than on the actual result.
+
+This is an acceptable trade-off at current concurrency. The bounded-wait + heartbeat + connection-lifecycle design ensures the failure mode is contained to a single user retry, not a fleet-wide cascade. Cross-instance wakeup (durable result store + LISTEN/NOTIFY signaling) is a future revision once concurrent consent volume justifies the additional infrastructure.
+
+### Implementation order
+
+1. Constants for the wall-clock cap and heartbeat interval (`app/consent_requests/agent/service.py`)
+2. Polled wait helper that wraps the per-tool `asyncio.Event`, emits heartbeats at the configured interval, re-checks cancellation, and falls through to a placeholder result on the cap
+3. Route refactor (`app/consent_requests/routes.py`) to acquire+release a short-lived DB session for prep, freeing the request DB connection before the SSE generator starts
+4. Cloud Run service config update (deploy script / `gcloud run services update` flags)
+5. Tests covering: heartbeat emission cadence, hard-cap returning a placeholder result, cancellation observed mid-wait, DB connection release before the first SSE chunk
+
+### Verification
+
+1. **Long owner wait** — agent emits `tool_call`, owner takes several minutes to respond → wait completes successfully, draft generated normally
+2. **Owner abandons screen** — agent emits `tool_call`, mobile app closes mid-wait → next heartbeat fails to write → route layer cancels turn within one heartbeat interval
+3. **Hard cap reached** — no `/tool-result` ever arrives → wait closes at the cap, agent receives placeholder, drafts a "couldn't reach device" message and emits `done`
+4. **Pool isolation** — under sustained parked-wait load, unrelated endpoints (`/api/chat/list`, `/api/scheduled-jobs`, channel webhooks) continue to respond with normal latency
+5. **Cancellation propagation** — supersede or `DELETE /agent-turn` observed by the parked wait within one heartbeat interval
+
+### Effort
+
+| Task | Hours |
+|------|-------|
+| Constants + polled wait helper | 2 |
+| Route handler refactor (DB session lifecycle) | 2 |
+| Cloud Run config update + deploy validation | 1 |
+| Tests | 2 |
+| **Total** | **7** |

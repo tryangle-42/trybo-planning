@@ -40,6 +40,8 @@ See: [phase-2-multi-channel-support.md](./phase-2-multi-channel-support.md)
 
 **Architecture**: 8 layers — wire/transport, agent orchestration (Pydantic AI), tool declarations, device-bridge executors, ephemeral state, scope constraint (drafting-only prompt), UI projection, surface integration. See the phased doc for the layer map.
 
+**Resilience**: every parked tool wait is bounded by a wall-clock cap, emits periodic SSE heartbeats so closed clients are detected mid-wait, and never holds a request-pool DB connection across the wait. A single slow consent flow cannot cascade to unrelated endpoints.
+
 See: [phase-3-agentic-ui-with-streaming.md](./phase-3-agentic-ui-with-streaming.md)
 
 ---

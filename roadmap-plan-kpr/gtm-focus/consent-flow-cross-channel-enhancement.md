@@ -638,6 +638,13 @@ This lives only for the duration of a single `/agent-turn` SSE stream. Nothing p
 
 **Freshness guarantee (non-negotiable):** every time the consent screen opens, the agent starts from zero. The backend `loop_state` is created when the SSE opens and released when it closes. The frontend `conversation_history` lives in a `useRef` and is cleared on unmount. Closing and reopening the screen gives a blank agent with no memory of the previous session. This constraint is intentional — the consent component is a trust boundary, not a chat history store. Learning owner preferences across sessions is a future Component 7 (User Memory) concern, out of scope here.
 
+**Parked-wait lifecycle (bounded, heartbeated, connection-light):** while the agent is parked on a `pending_tool_calls` Event awaiting the device's `/tool-result`, three rules govern resource usage:
+- **Bounded duration** — every wait has a hard wall-clock cap (multiple minutes). If no result arrives, the wait surfaces a `step` SSE event with `status: "timeout"` and the agent continues with a `{status: "timeout"}` placeholder, producing a graceful "couldn't reach the device for X" line in the draft. Waits are never indefinite.
+- **Periodic heartbeats** — the SSE stream emits a no-op keepalive comment at a fixed interval. This gives the route layer a write opportunity so closed mobile clients can be detected mid-park, and lets the cancellation flag (supersede or `DELETE /agent-turn`) be observed without waiting for the cap.
+- **Connection-light** — the route handler acquires a short-lived DB session for prep work and releases it before the SSE generator enters the agent loop. Tool executions that need DB access acquire their own session for that call only. A parked wait holds zero request-pool DB connections, so unrelated endpoints (chat list, scheduled jobs, channel webhooks) cannot be starved by accumulated parked agents.
+
+Together these properties guarantee that a single misbehaving consent flow can never cascade beyond one user retry — backend availability for unrelated traffic is invariant of consent agent state.
+
 ### 4.8 Frontend Orchestration Flow
 
 With the backend running the agent loop, the frontend is a **tool-executor + renderer**. Its state machine is:
