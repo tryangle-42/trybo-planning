@@ -1376,3 +1376,133 @@ This is an acceptable trade-off at current concurrency. The bounded-wait + heart
 | Cloud Run config update + deploy validation | 1 |
 | Tests | 2 |
 | **Total** | **7** |
+
+---
+
+## Change 6: Durable Agent State + Resume-by-`consent_request_id`
+
+**Why this matters:** The most production-grade pattern for human-in-the-loop AI agents is to make the agent's lifetime independent of the SSE connection's lifetime. Today, the agent runs inside the SSE — close the screen, lose the work; restart the instance, lose the work; have the owner take 4 minutes to find an OTP, hold a Cloud Run slot the whole time. Decoupling agent execution from the HTTP request lifetime via a durable state checkpoint removes the entire class of "parked SSE" failures (resource leaks, cross-instance routing, owner-time-bounds, instance-restart fragility) instead of merely bounding them.
+
+The consent agent gains a persistent working memory keyed by `consent_request_id`. When the agent reaches a long-wait boundary (emitting a `tool_call`), it persists its full state to the database and **closes the SSE**. When the device returns the tool result and the mobile reopens the screen, the backend **resumes the agent from the persisted snapshot** — Pydantic AI is rehydrated with the saved `message_history`, the resolved tool result is fed in, and the loop continues at iteration N+1 with no awareness it was ever paused.
+
+### Three lifecycle properties
+
+**1. Persistent agent memory scoped to a consent_request**
+
+The consent agent's working memory lives in a dedicated runtime store, separate from the audit-grade consent record. The store holds one row per active consent_request and is keyed by `consent_request_id`. The row holds a single JSONB blob containing two sub-structures:
+
+- **Agent runtime** — what the backend needs to rehydrate Pydantic AI: full `message_history` (ModelMessage[] from the agent loop), the map of pending `tool_call_id` → tool call descriptor, current iteration number, and a status enum
+- **UI render state** — what the mobile needs to repaint the consent screen on re-open: the chat thread (frozen agent bubbles + their step rows + step results + draft text), the pending OTP / permission grant request descriptor (if any), and channel/requester metadata
+
+Both sub-structures are snapshotted atomically as one row update. Backend reads agent runtime to resume the loop; frontend reads UI render state to repaint. Same source of truth, different consumers.
+
+**2. SSE closes at long-wait boundaries**
+
+When the agent emits a `tool_call`, the backend persists its current state, sends the `tool_call` SSE event to the mobile, and **closes the SSE**. The Cloud Run concurrency slot is released. No DB connection is held. No `asyncio.Event` is parked. The agent has effectively "paused itself to disk."
+
+The mobile sees the `tool_call` event, opens the OTP / permission popup as today, and the owner does whatever they do (taps OTP, switches apps, leaves the screen, comes back hours later). None of this matters to the backend — there is no parked process to maintain.
+
+**3. Resumption on tool_result delivery**
+
+When the mobile delivers the tool result (via `/tool-result` POST as today, or implicitly when the screen reopens with a pending result), the backend:
+- Looks up the agent state by `consent_request_id`
+- Validates the result corresponds to a pending tool call
+- Stores the result in the persisted state
+- Either fires a new SSE turn immediately (if the screen is open and listening) or simply persists the result for the next time the screen connects
+
+The mobile, on re-opening the screen, fetches the UI render state and **repaints the chat thread exactly as the owner left it** — same bubbles, same steps, same partial draft, same popup. The owner sees no "loading" or "starting fresh" — the screen looks like it never paused. They submit the OTP, a new SSE opens, the backend rehydrates Pydantic AI from the saved `message_history`, feeds in the tool result, and the agent continues streaming the draft from where it stopped.
+
+### What this design gives you
+
+- **Zero held resources during waits** — Cloud Run slot freed, DB connections freed, no parked coroutines anywhere
+- **Owner can take any amount of time** — minutes, hours, days; the wait is not bounded by any server-side timer
+- **Survives instance restarts** — agent state is durable, so deploys / autoscaler shrinks / OOMs do not lose work
+- **Cross-instance routing solved by removal** — there is no parked process to route to; whichever Cloud Run instance receives the next mobile request fetches the state and continues
+- **Pixel-identical reopen** — closing and reopening the screen mid-flow shows the **exact same chat thread** as when it was left: same agent bubbles in same order, same step rows with same status, same step result text, same draft text, same pending popup. Not a summary or approximation — the same screen the owner saw a moment before. Same UX contract as ChatGPT — your conversation is preserved verbatim across sessions.
+- **Same primitive serves future agentic chat memory** — the state-store pattern generalizes to any agent that needs durable conversation memory
+
+### Total-fidelity contract
+
+Whatever the mobile renders, the backend snapshots. The persisted state is the single source of truth for both halves: backend reads `agent_runtime` (full Pydantic AI `message_history` including all tool results) to rehydrate the agent and continue exactly where it stopped; mobile reads `ui_render_state` (full chat_messages, step lists, step_results map, partial draft text, partial agent_message text, pending OTP / permission popup) to rehydrate the React state exactly as it was. No abbreviation, no scrubbing, no "summary" form — verbatim restoration. If any rendered detail were missing from the snapshot, the memory would be incomplete and the contract broken.
+
+### Trust boundary scoping (preserves the "fresh agent per consent" contract)
+
+The consent component's existing trust posture — *"each new caller question gets a fresh agent with no memory of prior sessions"* — is preserved by the cleanup rule:
+
+- Agent state persists **for the lifetime of one consent_request only** (open status: `pending` / `in_progress`)
+- Agent state is **deleted immediately** when the consent_request reaches any terminal status (`approved`, `declined`, `expired`, `cancelled`) — same transaction as the status update
+- A new consent_request always starts with a fresh agent — no cross-consent state leakage
+
+Mid-flow refinements within a single consent_request now share state (which is what enables resumption). Across consent_requests, the trust boundary is intact.
+
+### Snapshot lifecycle
+
+State is written at every meaningful transition in the agent loop, so the owner never loses work — including the case where the agent finishes a draft with no tool calls, the owner closes the screen, then comes back later to refine. Reopening always continues from where the chat was left.
+
+1. **End of every agent iteration** — after each LLM call completes (whether it produced reasoning tokens, a draft, a tool_call, or a `done`). Persists the running `message_history` + UI render state up to this point. This is what gives the consent agent ChatGPT-style continuous memory within a consent flow.
+2. **Pre-park (tool_call emission)** — right before the agent emits a `tool_call` and the SSE closes for the long wait. Persists `message_history` + the pending tool descriptor + UI render state covering all chat bubbles produced so far.
+3. **Post-resume** — when the agent receives a tool result and continues the loop. Persists the updated `message_history` (now including the tool result) + cleared pending tool entry.
+4. **Terminal** — when the consent_request reaches `approved` / `declined` / `expired` / `cancelled`. The row is deleted in the same transaction as the status update. Cross-consent state never leaks.
+
+Snapshot writes are small JSONB UPSERTs on a single row, well under 50ms. Within a typical consent flow this is 5-15 writes total — negligible relative to the LLM call cost.
+
+### Mobile app responsibilities (changes from current)
+
+The mobile app gains two responsibilities to enable seamless resumption:
+
+- **On consent screen open** — fetch the UI render state along with the consent details. If present, hydrate the chat thread + reopen any pending popup (OTP, permission grant) so the screen repaints exactly as it was. If absent, treat as a fresh consent (today's behavior).
+- **On tool result submission** — same `/tool-result` POST as today; no new endpoint. The backend's resume path triggers automatically.
+
+The session-scoped `conversation_history` `useRef` pattern in the mobile hook stays for in-memory continuity within a single screen open, but the source of truth for cross-open state is now the backend.
+
+### What this design does NOT change
+
+- The SSE event format on the wire — same `tool_call` / `step` / `token` / `done` / `agent_message` events the mobile already parses
+- The `/tool-result` POST contract — same shape, same semantics
+- The Pydantic AI agent itself — same prompt, same tools, same iteration cap
+- The consent_requests table — its schema is untouched; the state store is a separate runtime table
+
+### Compatibility with the mechanical fix (Change 5)
+
+The bounded wait + heartbeats from Change 5 stay relevant for the **degenerate case** where the SSE remains open during a tool wait — i.e., the mobile is actively connected when the agent emits a tool_call, and rather than tearing the SSE down it can wait briefly for the result to come back in the same connection. The hard cap (180s) governs that opportunistic in-stream wait. Beyond the cap, the SSE closes cleanly and the durable-state path takes over for any longer wait. The two designs compose: Change 5 handles the short-wait happy path with a single open connection; Change 6 handles the long-wait path by checkpointing and resuming.
+
+### Implementation order
+
+1. New runtime table for the agent state (single JSONB column keyed by `consent_request_id`, foreign key + cascade to consent_requests)
+2. State serializer/deserializer in the agent service (snapshot + rehydrate helpers around Pydantic AI's `message_history`)
+3. Agent loop change: at every `tool_call` emission boundary, snapshot state then close the SSE (instead of parking). At iteration entry, rehydrate from state if present
+4. Tool-result handler: persist incoming result into the state row
+5. Resume endpoint or modified `/agent-turn` that detects pending state and continues without restarting from scratch
+6. Cleanup hook: terminal status transition deletes the state row in the same transaction
+7. Mobile changes: fetch UI render state on screen open, repaint chat thread + popups, no behavioral change on `/tool-result` submission
+8. Migration handling: in-flight consent flows at deploy time fall back to today's behavior (start fresh) — graceful coexistence
+9. Tests covering: snapshot/rehydrate round-trip, resume after fresh screen open, resume after instance restart simulation, cross-instance resumption (request goes to a different instance from the one that wrote the snapshot), terminal cleanup
+10. Phased rollout via feature flag (legacy path coexists with durable path until rollout reaches 100%, then legacy path removed)
+
+### Verification
+
+1. **Long owner wait** — agent emits `tool_call`, owner takes 30 minutes to respond → SSE closed during wait → no Cloud Run slot held → on owner's submit, state rehydrates, agent completes draft normally
+2. **Screen close + reopen mid-flow** — owner opens consent, agent emits OTP request, owner closes screen, reopens 5 minutes later → screen repaints with chat thread + OTP popup intact → owner submits → draft completes
+3. **Instance restart mid-wait** — agent emits tool_call and snapshots, then the Cloud Run instance is killed → mobile delivers tool_result to a different instance → state rehydrates on the new instance → agent continues normally
+4. **Cross-instance routing** — `/tool-result` POST to instance A, `/agent-turn` resume to instance B → state lookup by consent_request_id works regardless of instance
+5. **Concurrent screen opens** — same consent_request opened on two devices → both load the same UI render state → first to submit wins; second submission is rejected (idempotent)
+6. **Terminal cleanup** — owner approves the draft → consent_requests status → `approved`, agent_state row deleted in same transaction → next time the consent screen would never reopen anyway
+7. **Trust boundary** — close the consent screen with a draft in flight, manually cancel/expire the consent_request, then create a new consent_request for the same caller → fresh agent with no memory of the prior session
+
+### Effort
+
+| Task | Hours |
+|------|-------|
+| Migration: new agent_state runtime table + cascade FK | 2 |
+| Agent state snapshot/rehydrate helpers (Pydantic AI message_history serializer) | 6 |
+| Agent loop changes: snapshot-and-close at tool_call boundaries; rehydrate on iteration entry | 8 |
+| Tool-result handler: persist into state; trigger resume | 4 |
+| `/agent-turn` route changes: detect pending state, route to fresh-start vs resume path | 4 |
+| Cleanup hook: terminal status → delete state row in same transaction | 2 |
+| Mobile: fetch UI render state on screen open + repaint chat thread + popups | 8 |
+| Feature flag wiring + phased rollout config | 2 |
+| Migration handling for in-flight consents at deploy | 2 |
+| Tests (round-trip, resume, cross-instance, restart simulation, cleanup, trust boundary) | 8 |
+| Observability (state-row count gauge, snapshot/resume duration metrics) | 2 |
+| Documentation updates (master design, anti-patterns) | 2 |
+| **Total** | **~50 hours (~6-7 working days)** |

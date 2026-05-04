@@ -42,6 +42,8 @@ See: [phase-2-multi-channel-support.md](./phase-2-multi-channel-support.md)
 
 **Resilience**: every parked tool wait is bounded by a wall-clock cap, emits periodic SSE heartbeats so closed clients are detected mid-wait, and never holds a request-pool DB connection across the wait. A single slow consent flow cannot cascade to unrelated endpoints.
 
+**Durable resume**: long tool waits do not park the SSE — the agent's working memory (Pydantic AI `message_history` + pending tool calls + UI render state) is checkpointed to a runtime store keyed by `consent_request_id`, and the SSE closes cleanly. When the device returns the result and the screen reopens, the backend rehydrates Pydantic AI from the snapshot and continues at the next iteration; the mobile repaints the chat thread exactly as it was. Owner reaction time becomes unbounded; no Cloud Run slot is held during waits; instance restarts and cross-instance routing become non-issues. State is wiped immediately on terminal consent status to preserve the cross-consent trust boundary.
+
 See: [phase-3-agentic-ui-with-streaming.md](./phase-3-agentic-ui-with-streaming.md)
 
 ---
