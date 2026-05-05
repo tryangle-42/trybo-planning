@@ -1311,11 +1311,11 @@ All new fields are optional with defaults → backend and frontend can be deploy
 
 **1. Bounded duration**
 
-Every tool wait has a hard wall-clock cap of **180 seconds (3 minutes)**. If no `/tool-result` arrives within the cap, the wait surfaces a `step` SSE event with `status: "timeout"` and the agent loop continues with a `{status: "timeout"}` placeholder result. 3 minutes covers realistic owner reaction time for the slowest expected case (OTP retrieval — read SMS, switch app, type, submit) plus FCM notification delay and network round-trip, while still releasing resources promptly when the device is genuinely unreachable. The agent treats a timed-out tool the same way it treats a `permission_denied` result: continue drafting with what it has and surface a "couldn't reach the device for X" line in the response.
+Every tool wait has a hard wall-clock cap of **20 seconds**. The cap exists to free Cloud Run slots and DB connections quickly when the device is unreachable or the owner has walked away. Within the cap, fast device tools (`search_contacts`, `get_calendar_events`, `get_messages`, `get_current_location`, `get_time`) almost always resolve in well under a second, so the in-stream wakeup path delivers their results with no SSE close. Slow human-input tools (`request_otp`, permission grants) typically exceed the cap; when they do, the SSE closes silently — there is **no `step: timeout` placeholder anymore** — and Change 6's durable resume path takes over (the snapshot taken at the `tool_call` boundary already captured everything needed). The agent never sees a synthetic timeout result; instead, when the device eventually delivers the result via `/tool-result`, the agent rehydrates from the snapshot and continues from where it stopped.
 
 **2. Periodic heartbeats**
 
-While the wait is parked, the SSE stream emits a no-op keepalive comment at a regular interval. Two purposes:
+While the wait is parked, the SSE stream emits a no-op keepalive comment every **4 seconds** (so 5 heartbeats fit inside the 20s window). Two purposes:
 - The route layer's disconnect check can only observe a closed mobile client between byte writes. With no writes happening during the park, a closed client would otherwise stay invisible to the server. Heartbeats give the framework that write opportunity, so closed clients are detected within one heartbeat interval.
 - The cancellation flag (set by supersede or `DELETE /agent-turn`) is re-checked each interval, so superseded turns terminate promptly instead of running to the wall-clock cap.
 
@@ -1331,7 +1331,7 @@ This guarantees the request DB pool is never drained by accumulated parked agent
 
 The Cloud Run service running the agent endpoint is configured for fast failure and bounded blast radius:
 
-- **Request timeout: 210 seconds** — slightly higher than the agent's own 180s wall-clock cap so the agent's `step: timeout` event always fires first (cleanly) rather than the platform killing the request with a raw 504
+- **Request timeout: 60 seconds** — comfortably above the agent's 20s wall-clock cap plus iteration overhead, so the platform never kills an in-flight stream prematurely; SSE closes cleanly via the in-stream cap, never via a raw 504
 - **Per-instance concurrency: 40** — half the default; limits parked-request count per instance
 - **Minimum instance count: 2** — eliminates cold-start stampede when traffic resumes after a quiet period
 - **Maximum instance count: 20** — bounds total fleet damage from any runaway loop
@@ -1439,10 +1439,11 @@ Mid-flow refinements within a single consent_request now share state (which is w
 
 State is written at every meaningful transition in the agent loop, so the owner never loses work — including the case where the agent finishes a draft with no tool calls, the owner closes the screen, then comes back later to refine. Reopening always continues from where the chat was left.
 
-1. **End of every agent iteration** — after each LLM call completes (whether it produced reasoning tokens, a draft, a tool_call, or a `done`). Persists the running `message_history` + UI render state up to this point. This is what gives the consent agent ChatGPT-style continuous memory within a consent flow. **Applies even to fast no-tool-call flows** — uniform iteration-end snapshotting so reopen always restores prior chat regardless of flow shape.
+1. **End of every agent iteration** — after each LLM call completes (whether it produced reasoning tokens, a draft, a tool_call, or a `done`). Persists the running `message_history` + UI render state up to this point. This is what gives the consent agent ChatGPT-style continuous memory within a consent flow. **Applies even to fast no-tool-call flows** — uniform iteration-end snapshotting so reopen always restores prior chat regardless of flow shape. Also covers the **post-resume** case: when the agent consumes an in-flight tool result via `DeferredToolResults` and runs iteration N+1, the iteration-end snapshot captures the consumed result inside `message_history` (no separate "post-resume" snapshot is needed).
 2. **Pre-park (tool_call emission)** — right before the agent emits a `tool_call` and the SSE closes for the long wait. Persists `message_history` + the pending tool descriptor + UI render state covering all chat bubbles produced so far.
-3. **Post-resume** — when the agent receives a tool result and continues the loop. Persists the updated `message_history` (now including the tool result) + cleared pending tool entry.
-4. **Terminal** — when the consent_request reaches `approved` / `declined` / `expired` / `canceled` (matches the existing schema CHECK constraint — one-`l` spelling). The row is deleted in the same transaction as the status update. Cross-consent state never leaks.
+3. **Terminal** — when the consent_request reaches `approved` / `declined` / `expired` / `canceled` (matches the existing schema CHECK constraint — one-`l` spelling). The row is deleted in the same transaction as the status update. Cross-consent state never leaks.
+
+**Not a snapshot point:** `POST /tool-result` does NOT write its own snapshot. The in-flight tool result is held in the request handler's local memory while the agent rehydrates and consumes it; the next iteration-end snapshot captures the consumed result via `message_history`. This keeps the snapshot sequence purely agent-driven (one snapshot per iteration boundary, one at tool_call emission) and avoids an intermediate "tool_result_received" status that would represent state the agent has not yet processed.
 
 Snapshot writes are small JSONB UPSERTs on a single row, well under 50ms. Within a typical consent flow this is 5-15 writes total — negligible relative to the LLM call cost.
 
@@ -1457,17 +1458,25 @@ Snapshot writes are small JSONB UPSERTs on a single row, well under 50ms. Within
 
 The mobile app gains two responsibilities to enable seamless resumption:
 
-- **On consent screen open** — fetch the UI render state along with the consent details. If present, hydrate the chat thread + reopen any pending popup (OTP, permission grant) so the screen repaints exactly as it was. If absent, treat as a fresh consent (today's behavior).
-- **On tool result submission** — same `/tool-result` POST as today; no new endpoint. The backend's resume path triggers automatically.
+- **On consent screen open** — fetch the UI render state along with the consent details. If present, hydrate the chat thread + reopen any pending popup (OTP, permission grant) so the screen repaints exactly as it was. If absent, treat as a fresh consent (today's behavior). If `agent_state.has_pending_resume === true` (a tool result was POSTed but the previous SSE was killed before consuming it), auto-fire a resume `/agent-turn` after hydrate; otherwise wait for owner action.
+- **On tool result submission** — `/tool-result` POST returns one of two response types depending on whether a parked SSE exists in backend memory: JSON 200 (alive case — original `/agent-turn` SSE delivers events via in-stream wakeup) OR `text/event-stream` (dead case — same response carries the resumed iteration's events). Mobile picks the right reader by checking `connectionRef.current` before posting — alive → plain JSON POST, dead → SSE-reading POST that dispatches events through the same `_handleEvent` handler.
 
 The session-scoped `conversation_history` `useRef` pattern in the mobile hook stays for in-memory continuity within a single screen open, but the source of truth for cross-open state is now the backend.
 
 ### What this design does NOT change
 
 - The SSE event format on the wire — same `tool_call` / `step` / `token` / `done` / `agent_message` events the mobile already parses
-- The `/tool-result` POST contract — same shape, same semantics
+- The `/tool-result` POST request shape — same body (`tool_call_id`, `status`, `result`, `error`); the response shape is now content-type-aware (JSON 200 for alive-SSE wakeup, SSE for durable resume)
 - The Pydantic AI agent itself — same prompt, same tools, same iteration cap
 - The consent_requests table — its schema is untouched; the state store is a separate runtime table
+
+### Known gaps (TB-781 follow-ups, currently unfixed in code)
+
+These were identified during self-audit and are tracked separately:
+
+1. **Refinement instruction lost on resume.** `_run_loop`'s `send_user_prompt = state.iterations == 1 and not state.message_history` drops the refinement instruction whenever a saved snapshot exists. Fix: `send_user_prompt = state.iterations == 1 and (instruction is not None or not state.message_history)` so any owner-typed instruction is always passed on the first iteration of a new turn.
+2. **Resume-with-no-input invokes the agent for nothing.** If mobile POSTs `/agent-turn` with no instruction AND a completed snapshot exists with no pending tool calls, the agent loop runs anyway and re-invokes the LLM. Fix: early-return guard at the top of `run_agent_turn`.
+3. **`MAX_ITERATIONS` accumulates across turns.** `state.iterations = saved.get("iteration") or 0` inherits the prior turn's count, so a refinement after a 3-iteration initial draft has only 2 iterations of budget. Fix: always reset `state.iterations = 0` at the start of `run_agent_turn` (the per-turn budget); resume path inside `run_resume_with_tool_result` continues to inherit from saved (same-turn continuation).
 
 ### Compatibility with the mechanical fix (Change 5)
 
@@ -1520,15 +1529,16 @@ The bounded wait + heartbeats from Change 5 stay relevant for the **degenerate c
 | 1 | Storage location | Separate table `app.consent_agent_state` (NOT a column on `consent_requests`). PK + FK + ON DELETE CASCADE to `consent_requests.id`. |
 | 2 | Schema shape | Single `state` JSONB column holding both `agent_runtime` (Pydantic AI `message_history`, pending tool calls, iteration, status, last refinement) and `ui_render_state` (chat_messages, current_steps, current_step_results, current_draft_text, current_agent_message, pending_otp_request, pending_permission_grant). |
 | 3 | Race policy | `INSERT … ON CONFLICT (consent_request_id) DO UPDATE` — atomic UPSERT, last-write-wins. No explicit `SELECT FOR UPDATE`. Both writers always carry full latest state, so MVCC handles serialization. Matches LangGraph / Pydantic AI community pattern. |
-| 4 | Snapshot points | (a) End of every agent iteration — including fast no-tool-call flows. (b) Tool_call emission boundary, immediately before SSE closes. (c) Post-resume after a tool result is received. (d) Terminal status → DELETE the row. |
-| 5 | What is persisted | Verbatim — full `message_history` (including tool results), full UI render state. No scrubbing, no summarization. Pixel-identical reopen contract. |
+| 4 | Snapshot points | (a) End of every agent iteration — including fast no-tool-call flows. (b) Tool_call emission boundary, immediately before SSE closes. (c) Terminal status → DELETE the row. **No intermediate snapshot at `/tool-result` POST time** — the in-flight tool result lives in the request handler's local memory until the agent consumes it; the next iteration's snapshot captures the consumed result via `message_history`. |
+| 5 | What is persisted | Verbatim — full `message_history` (including tool results), full UI render state. No scrubbing, no summarization. Pixel-identical reopen contract. The `ui_render_state` blob carries `chat_messages`, `current_steps`, `current_step_results`, `current_draft_text`, `current_agent_message`, `pending_otp_request`, `pending_permission_grant`, `sse_events` (verbatim event log mobile replays on reopen), and `has_pending_resume` (true when any `pending_tool_calls` descriptor has a non-null `result`). |
 | 6 | Cleanup policy | Hard DELETE on terminal status, same transaction as the status UPDATE. Single hook in `ConsentRequestStore._update_status()` (the existing funnel for `mark_approved` / `mark_declined` / `mark_expired`). No soft-delete, no retention window, no audit archive. FK CASCADE handles the rare hard-delete-of-consent_request edge as a backstop. No background sweep. No Postgres trigger. |
-| 7 | Mobile resume signal | `GET /consent-request/{id}/details` returns `agent_state` field (UI portion only). `null` = fresh start; present = repaint and resume. Backend never exposes the internal `agent_runtime` / `message_history` to the client. |
-| 8 | Mobile reopen behavior | Render-only repaint on screen open. Mobile does NOT auto-fire a new `/agent-turn` POST unless the saved state shows a resolved tool result waiting to be processed. Owner action is what drives the next turn. |
+| 7 | Mobile resume signal | `GET /consent-request/{id}/details` returns `agent_state` field (UI portion only). `null` = fresh start; present = repaint. Backend never exposes the internal `agent_runtime` / `message_history` to the client. The `has_pending_resume` boolean inside `agent_state` tells mobile whether a pending tool result is waiting for the agent to consume (auto-fire resume on screen reopen). |
+| 8 | Mobile reopen behavior | Render-only repaint on screen open. Owner action is what drives the next turn. The next turn is delivered via `POST /tool-result` (which itself returns SSE in the durable case, see #16) — mobile does NOT need to fire a separate `/agent-turn` POST after delivering a tool result. The only auto-fire case on screen reopen is when `has_pending_resume === true` (a tool result was POSTed but the previous SSE was killed before consuming it). |
 | 9 | Concurrent multi-device collision | Non-issue. Single-device session enforcement (decisions.md #10) means only one device can be authenticated at any moment. No idempotency mechanism needed beyond what naturally falls out. |
 | 10 | RLS | Enabled with `consent_agent_state_deny_authenticated` policy returning `false` for the `authenticated` role. Service-role bypasses RLS. No user-facing endpoint reads this table directly. |
 | 11 | Trust-boundary scoping | Within one consent_request lifetime: state persists across screen close/reopen (mid-flow refinements share state). Across consent_requests: hard isolation (each new consent always gets a fresh agent). |
 | 12 | In-flight consent handling at deploy | Graceful coexistence. Pre-deploy in-flight SSE coroutines run to natural completion under the old behavior (bounded by Change 5's mechanical cap). New consents use the durable resume path. Old code path retired ~24h after deploy once in-flight flows have drained. |
 | 13 | Cross-repo PR coordination | Two PRs on the same branch name, shipping together: backend (`trybot-api`) + mobile (`trybot-ui`). Backend's `agent_state: null` response is graceful-fallback for old mobile builds during the rollout window. |
 | 14 | Status spelling | Use `'canceled'` (single `l`) — matches the existing `app.consent_requests.status` CHECK constraint. |
-| 15 | Composition with Change 5 (mechanical fix) | Both designs coexist. Change 5's bounded wait + heartbeats handle the short-wait happy path where the SSE remains open for fast device responses. Change 6's snapshot-and-close-SSE takes over for any wait that would exceed the in-stream cap. The mechanical fix is the in-stream cap; the architectural fix is what happens beyond it. |
+| 15 | Composition with Change 5 (mechanical fix) | Both designs coexist. Change 5's bounded 20s wait + 4s heartbeats handle fast device responses in-stream (search_contacts, get_calendar_events, etc. resolve in well under 1s — no SSE close, lowest latency). Change 6's snapshot-at-tool_call-boundary + durable resume takes over when the wait exceeds 20s (OTP, permission grants, owner stepped away). On wait expiry the SSE closes silently — there is no synthetic `step: timeout` event anymore; the agent rehydrates from the snapshot when the device delivers the result. |
+| 16 | Single-round-trip resume on tool-result | `POST /tool-result` is dual-mode based on whether an in-memory turn exists for this consent_request: alive-SSE path returns JSON 200 (in-stream wakeup signals the parked agent's `asyncio.Event`); dead-SSE path returns `StreamingResponse` (text/event-stream) — the handler holds the tool result in local memory, rehydrates the agent from DB, hands the result to the rehydrated agent via `DeferredToolResults`, and streams the resumed iteration's events on the same response (`tool_result_ack` + `step:completed` + `step_result` summary, then iteration N+1's drafting/tokens/done). Mobile picks the right path by checking `connectionRef.current` — alive → JSON POST, dead → SSE-reading POST that dispatches events through the same `_handleEvent` handler the `/agent-turn` SSE uses. **No separate `/agent-turn` POST is fired by mobile to resume after a tool result.** |
