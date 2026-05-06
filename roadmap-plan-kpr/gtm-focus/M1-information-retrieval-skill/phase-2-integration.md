@@ -417,11 +417,20 @@ Composio decouples OAuth credential configuration from runtime code. The runtime
 
 ### 4.3a How does the agent decide which source to query when a category has multiple?
 
-The agent reads the data category from the request, looks up the category's source list (preferred → fallback order, drill-down tools excluded), and tries the FIRST source. If that source returns `needs_connection` or `needs_device_permission`, the agent surfaces the embedded permission_flow to the owner and stops — the owner asked for the preferred source, silently falling back would override that intent. If the source returns a transient `error` (upstream unavailable, rate-limited, internal), the agent moves to the NEXT source in the list. On `ok`/`partial`, the agent uses the data and does not call additional sources for that category in the same turn. This is **sequential preferred-first with fallback on transient errors only**, not parallel fan-out.
+There is **no default preference among sources** — selection is driven entirely by the owner's prompt at runtime. The skill registry exposes the category-to-sources mapping; the agent applies one of two modes per request:
 
-If the owner names a specific source ("check my Google Calendar", "use device contacts"), the agent skips the chain and calls that source directly.
+**MODE A — owner names a specific source** ("check my Google Calendar", "use device contacts"). The agent calls only that source. If it returns `needs_connection` / `needs_device_permission`, the agent surfaces the permission_flow and does not touch other sources for the category — the owner's explicit choice is honored.
 
-This rule is the dominant pattern across Composio, Auth0, and Arcade for category-substitutable sources (calendar, email, contacts) — fan-out is reserved for genuinely complementary sources (web research). Drill-down tools (`gmail_get_thread`, `googlecalendar_get_event`) are excluded from the category chain because they're follow-ups by id from a prior primary call, not category alternatives.
+**MODE B — owner does not name a source** ("check my availability tomorrow", "find Sharma's number"). The agent calls every source listed for the relevant category, one at a time, and handles each source's result independently. Successful results (`ok`/`partial`) are kept and the agent moves on. A `needs_connection` / `needs_device_permission` result is **blocking for the draft**: the agent surfaces the permission_flow and marks that source PENDING. Transient `error` results are logged and the agent continues. After every source for the category has been tried this turn, the agent applies the gating rule:
+
+  * **Any source PENDING** → do **not** draft a partial answer. Respond in ANSWER mode telling the owner exactly what they need to connect / grant ("I checked your device calendar; connect your Google Calendar so I can finish the availability check"). End the turn.
+  * **No source PENDING** → merge the successful results and draft the response.
+
+On the next turn, after the owner resolves the pending permission, the agent retries the previously-pending source, gets the data, and finally drafts with the full merged result. **The category's draft is gated on every source being either resolved (ok/partial) or non-blockingly failed (error).** Permission flows are completion steps, not annotations on a partial answer.
+
+This is **prompt-driven source selection**, not registry-baked preference. CALENDAR has both Google Calendar (third-party) and device calendar today; an ambiguous request hits both, blocks on any pending OAuth, and only drafts once both sources are resolved. An explicit "Google Calendar" request hits only that one. As new sources are added, the agent picks up the same MODE A / MODE B behavior automatically — no rule changes needed.
+
+Drill-down tools (`gmail_get_thread`, `googlecalendar_get_event`) are excluded from the category list in MODE B because they're follow-ups by id from a prior primary call, not category alternatives.
 
 ### 4.3b Why does the agent see all sources, including disconnected third-party ones?
 
@@ -430,6 +439,33 @@ Filtering disconnected sources out of the agent's tool list would silently bypas
 ### 4.3c Why is the categorized prompt block owned by the IR Skill module rather than each agent?
 
 The category structure, the preference order, and the agent-facing source-selection rules are part of the skill's contract — they describe what the skill exposes, not how a particular agent runtime calls it. Both the Pydantic AI consent agent and the LangGraph main chat agent paste the same rendered block plus the same rules constant into their respective system prompts. Owning this in the registry module guarantees the two agents reason identically about source selection. Adding a new source post-launch updates one place and reaches both agents automatically; if each agent owned its own version of the block, drift between them would be a routine bug source.
+
+### 4.3f How is the agent forced to query every primary source for a category before drafting?
+
+The MODE A / MODE B prompt rules describe the intended behavior but, taken alone, an LLM (even a capable one like gpt-4.1) is biased toward minimizing tool calls — once it has data from one source, it tends to draft instead of continuing to the next source. Pydantic AI's loop is observe-then-act, but it does not enforce a *visible Thought* between observations and actions, so the model can skip the "have I covered everything yet?" check.
+
+The runtime closes this gap with **strict ReAct prompt enforcement**. The system prompt requires the agent to emit a single line beginning with the literal token `Thought:` before every tool call. The Thought must state: (a) what data is still needed, (b) which sources have already been called this turn, (c) which primary sources for the relevant category remain uncalled, and (d) which tool the agent is about to call next and why. After a tool returns, the next response must again start with a fresh Thought — keeping the Observe → Think → Act loop visible and disciplined.
+
+Only after every primary source for the category has been called does the agent emit a closing Thought confirming coverage is complete and proceed to draft or answer. Skipping the Thought is defined in the prompt as a protocol violation. This is the strict ReAct pattern — the same observation channel pressure that papers (and shipped agents like smolagents) rely on to keep multi-tool iteration disciplined. We do not patch the iteration with runtime coverage hints injected into tool results; the discipline lives in the model's own response format.
+
+### 4.3g How does every tool call surface as a UI step, regardless of execution mechanism?
+
+From the agent's reasoning view, every data source is just a tool. From the runtime's perspective, two execution mechanisms exist:
+
+  * **Deferred to client** (Pydantic AI's ExternalToolset) — the agent emits a deferred request; the runtime yields a `tool_call` SSE event; the React Native client renders a step bubble; the client executes the work and POSTs the result back. Used for sources where the work runs on the device (calendar, contacts via OS APIs).
+  * **Server-side function** (Pydantic AI's FunctionToolset) — the tool runs synchronously inside the agent's run loop on the server. Used for sources reached via Composio (Gmail, Google Calendar today).
+
+By default, only the first kind yields events the SSE consumer can pick up. Server-side function tools would execute silently — the owner would never see "Searching your Gmail…" or "Checking your Google Calendar…" the way they see "Checking your calendar…" for the deferred path. That violates the core UI-visibility constraint that every step the agent takes must be visible in chat.
+
+The runtime closes this gap with a per-turn SSE event queue. Each server-executed data source tool pushes a `tool_call` event before invoking its underlying adapter and a `tool_result_ack` event when it returns, into a contextvar-bound list. Between iterations of the agent's run loop, the runtime drains the queue and yields each entry as an SSE event with the same shape as the deferred-tool events. The chat UI renders both kinds of step bubbles uniformly — the owner sees a step for every tool call, regardless of where it executed.
+
+### 4.3e How does the owner connect a third-party source from the chat?
+
+The connect flow happens **entirely inside the chat thread**, mirroring the device-permission grant UX. When a third-party tool returns `needs_connection`, the agent does not respond with text asking the owner to navigate to the Connected Data Sources screen. Instead, the agent calls a deferred orchestration tool (`request_third_party_connection`) that the runtime emits as a SSE tool_call event. The chat UI renders this exactly like the existing device-permission grant bubble: a card with two buttons — Connect (filled) and Not now (outlined).
+
+Tapping Connect opens the in-app browser at the OAuth URL produced by `POST /api/data-sources/connect`. The owner completes the provider's consent screen, the browser closes via the `trybo://data-sources/connected` deep link, and the chat UI submits the deferred-tool result `{connected: true}`. The agent then retries the original third-party tool, gets the data, and proceeds. Tapping Not now submits `{connected: false}`; the agent acknowledges in ANSWER mode and stops the category fetch (or, in MODE B, drafts with whatever other sources succeeded).
+
+The owner never leaves the chat. The Connected Data Sources screen exists for management (list, status, disconnect), not as a connect entrypoint during a conversation.
 
 ### 4.3d Why are drill-down tools excluded from the category preference chain?
 
