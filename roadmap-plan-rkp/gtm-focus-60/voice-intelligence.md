@@ -6,6 +6,29 @@
 
 ---
 
+> ## ⚠️ Superseded — kept for historical context
+>
+> This document was authored on **2026-04-25** as a baseline-definition reference for the voice subsystem, before KPR's platform research landed. **For active milestone planning, use [`milestone-tb-660-plan.md`](./milestone-tb-660-plan.md)** and the underlying research in `../../agentic-orchestration/Review-L4-first-party-communication-skill/agentic-voice-calling/` (`vci-platform-decision.md`, `phase-1-pipecat-voice-ai-pipeline.md`, `phase-2-vci-5-layers.md`, `system-design.md`).
+>
+> **Specifically superseded:**
+> - Pipeline framework: LiveKit Agents → **Pipecat** (LiveKit Agents needs SIP trunking we don't have for Knowlarity)
+> - Default TTS: Cartesia Sonic → **ElevenLabs multilingual v2** (auto-detects language from text)
+> - Hindi TTS / ASR provider split (Sarvam Bulbul + Sarvam Saaras + Deepgram) → **single-provider ElevenLabs Scribe + multilingual v2**, with Sarvam Saaras as a discrete fallback gated on Hinglish WER (see SM-G in milestone plan)
+> - Language routing via user `preferred_language` setting → **STT auto-detection**, no per-turn directive
+> - Latency target <800ms voice-to-voice → **p90 ≤ 2.0s** (the <800ms target underestimated LLM TTFT, which alone is ~500–800ms)
+>
+> **Still useful and folded into the milestone plan:**
+> - The "what counts as refinement" out-of-scope list (noise cancellation, speculative execution, sentiment, multiple voice profiles, transcript analysis)
+> - Concrete handoff-to-human triggers (explicit request, 3+ "I don't understand", keyword detection)
+> - Smart-hold pattern (template voice every 8–10s with early resume)
+> - Pre-cached common-utterance audio as a latency optimization
+> - The Sarvam-for-Hinglish risk argument (now an explicit risk + validation gate)
+> - "Why streaming is the #1 optimization" — same insight as KPR's research
+>
+> Do not treat this doc's provider choices, framework choice, or latency targets as authoritative.
+
+---
+
 ## What This Is
 
 The voice pipeline that makes the agent sound human and respond in real-time during calls. Five sub-systems:
