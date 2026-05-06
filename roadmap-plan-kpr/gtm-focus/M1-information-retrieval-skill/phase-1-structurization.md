@@ -55,7 +55,7 @@ Phase 1 introduces a deliberate separation between two orthogonal axes that prev
 |---|---|---|
 | `EMAIL` | Email messages, threads, senders | gmail (third-party) |
 | `CALENDAR` | Scheduled events, availability | googlecalendar (third-party), device_calendar (device) |
-| `CONTACTS` | People's phone / email / name | googlecontacts (third-party), device_contacts (device) |
+| `CONTACTS` | People's phone / email / name | device_contacts (device) |
 | `OTP` | One-time SMS verification codes | device_otp (device) |
 | `LOCATION` | The user's current physical location | device_location (device) |
 | `TRANSCRIPTS` | Past Trybo conversation history | internal — *future* |
@@ -236,7 +236,7 @@ Step 1 — Analyzer (Pydantic AI agent, existing):
   Inputs: caller, request, channel, conversation context.
   Output (structured Pydantic model):
     {
-      data_sources_needed: ["gmail", "googlecontacts"],
+      data_sources_needed: ["gmail", "device_contacts"],
       information_retrieval_prompt: "find recent emails from Sharma
                                      about the deployment",
       ...
@@ -404,9 +404,7 @@ Each category has one or more sources:
       device_calendar_read(time_range)
 
   CONTACTS
-    googlecontacts (third-party)                 [preferred when connected]
-      contacts_search(name?, phone?)
-    device_contacts (device)                     [fallback / always available]
+    device_contacts (device)                     [only source in v1]
       device_contacts_search(query)
 
   OTP
@@ -503,13 +501,9 @@ CATEGORY_REGISTRY: list[InformationCategory] = [
         display_label="Contacts",
         description="A person's phone, email, or name",
         sources=[
-            CategorySource(source_key="googlecontacts",
-                           origin="third_party",
-                           preference="preferred",
-                           tool_names=["contacts_search"]),
             CategorySource(source_key="device_contacts",
                            origin="device",
-                           preference="fallback",
+                           preference="only",
                            tool_names=["device_contacts_search"]),
         ],
     ),
@@ -556,7 +550,6 @@ Same set bound for both consent-request agent and main chat agent. Per-source ty
 | CALENDAR | `calendar_list_events(time_range)` | googlecalendar | Events in range |
 | CALENDAR | `calendar_get_event(event_id)` | googlecalendar | Single event detail |
 | CALENDAR | `device_calendar_read(time_range)` | device_calendar | Via `interrupt()` |
-| CONTACTS | `contacts_search(name?, phone?)` | googlecontacts | Find by name or phone |
 | CONTACTS | `device_contacts_search(query)` | device_contacts | Via `interrupt()` |
 | OTP | `device_request_otp(timeout_seconds)` | device_otp | Via `interrupt()` |
 | LOCATION | `device_get_location()` | device_location | Via `interrupt()` |
@@ -697,7 +690,6 @@ trybot-api/app/agentic_mvp/skills/information_retrieval/
   │     ├── base.py               # DataSourceAdapter ABC: 4 methods
   │     ├── third_party_gmail.py
   │     ├── third_party_googlecalendar.py
-  │     ├── third_party_googlecontacts.py
   │     ├── device_calendar.py
   │     ├── device_contacts.py
   │     ├── device_otp.py
@@ -782,7 +774,6 @@ from app.skills.information_retrieval.tools import (
 ADAPTER_BY_SOURCE = {
     "gmail":            gmail_search_emails,
     "googlecalendar":   calendar_list_events,
-    "googlecontacts":   contacts_search,
     "device_calendar":  device_calendar_read,
     "device_contacts":  device_contacts_search,
     "device_otp":       device_request_otp,
@@ -895,7 +886,7 @@ For sequencing context. Detailed in `phase-2-integration.md`.
 | `user_data_source_connections` Supabase migration + `ENABLED_DATA_SOURCES` real list | 1 |
 | `DEVICE_DATA_SOURCES` registry wiring with `permissionService.ts` mapping | 1 |
 | FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled) | 6.5 |
-| Real adapters replacing Phase 1 stubs: gmail, googlecalendar, googlecontacts | 4.5 |
+| Real adapters replacing Phase 1 stubs: gmail, googlecalendar | 4.5 |
 | Real adapters: device_calendar, device_contacts, device_otp, device_location — main agent path uses `interrupt()` → RN; consent agent path uses existing RN device-fetch flow (same envelope shape, two orchestrations) | 6 |
 | `marketplace_composio.py` migration to Composio SDK + read from `connected_data_sources` dict | 1.5 |
 | Backend Google cleanup (remove `google_service.py`, `google_api_client.py`, `google_user_profile_service.py`, `token_encryption.py` (Google paths), `routes/google.py`) | 4 |
@@ -1060,7 +1051,7 @@ Phase 2 (Integration) — fills the contract with real code
   ├── ENABLED_DATA_SOURCES + DEVICE_DATA_SOURCES real wiring
   ├── FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled)
   ├── Real adapters replacing stubs:
-  │     third-party: gmail, googlecalendar, googlecontacts (Composio)
+  │     third-party: gmail, googlecalendar (Composio)
   │     device: device_calendar, device_contacts, device_otp, device_location (interrupt → RN)
   ├── marketplace_composio.py migration to Composio SDK
   ├── Backend Google cleanup (custom-OAuth Google data-access stack removal)

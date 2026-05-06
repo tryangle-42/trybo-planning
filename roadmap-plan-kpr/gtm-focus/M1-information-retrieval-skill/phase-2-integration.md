@@ -127,11 +127,11 @@ Crisp principle: **the agent is the brain, the skill is a thin pipe**. The skill
 1. The agent decides — during a chat turn or while drafting a consent reply — that it needs data from a source the user hasn't connected. The agent surfaces a "Connect [Provider]" prompt as part of its response. **The agent owns this UX; M1 simply exposes the connection state the agent reads.**
 2. The user taps the prompt.
 3. The mobile app asks the backend to start an OAuth flow for that source.
-4. The backend asks Composio to initiate a connection for this user against that toolkit. Composio returns a redirect URL to the provider's consent screen.
+4. The backend resolves the workspace's auth-config identifier for that toolkit by querying Composio at runtime (cached per process after the first lookup). Auth-config identifiers are workspace-private — they live in the Composio dashboard, not in the codebase or environment files. The backend then asks Composio to initiate a connection for this user against that auth config. The backend embeds the user's identifier and the source slug into the callback URL it hands Composio, so identity survives the OAuth round-trip. Composio returns a redirect URL to the provider's consent screen.
 5. The mobile app opens that URL **in the in-app browser**.
 6. The user sees the provider's consent screen and grants access. (The screen says "Trybo" or "Composio" depending on whether Trybo has registered custom OAuth credentials in the Composio dashboard for this toolkit — this is dashboard-only configuration, not a code change.)
 7. The provider redirects to Composio's callback. Composio exchanges the code for tokens, encrypts and stores them in its vault.
-8. Composio redirects to **Trybo's** backend callback URL with the new `connected_account_id`.
+8. Composio redirects to **Trybo's** backend callback URL — appending the new `connected_account_id` and echoing the user identifier and source slug the backend originally embedded.
 9. The backend verifies the connection with Composio, writes a row to `user_data_source_connections` (one row per `(user, source)`), then returns an HTTP 302 to the deep link `trybo://data-sources/connected?source_key=…`.
 10. The in-app browser observes the `trybo://` URL and dismisses itself, returning the user to the app.
 11. The mobile app's deep-link router fires, refreshes the connection list, and notifies any waiting screen.
@@ -197,8 +197,8 @@ The backend keeps a thin list of Composio toolkit slugs at `trybot-api/app/const
 ENABLED_DATA_SOURCES: list[str] = [
     "gmail",            # M1 v1
     "googlecalendar",   # M1 v1
-    "googlecontacts",   # M1 v1
     # --- Below: candidates for future enablement, NOT in M1 v1 ---
+    # "googlecontacts",
     # "googledrive",
     # "outlook",
     # "outlookcalendar",
@@ -366,7 +366,7 @@ The following are part of the broader Information Retrieval Skill but **not** in
 
 - A Composio account.
 - `COMPOSIO_API_KEY` (and `COMPOSIO_BASE_URL` only if non-default). Both already exist as backend env vars.
-- Toolkit enablement on the Composio dashboard for `gmail`, `googlecalendar`, `googlecontacts`.
+- Toolkit enablement on the Composio dashboard for `gmail` and `googlecalendar` (one auth config per toolkit; the dashboard-issued auth-config identifier for each is set in `.env` — see §3.13). Google Contacts is not in v1.
 - (Optional, any time post-launch) Custom OAuth credential registration in Google Cloud Console, paste into Composio's dashboard, when "Trybo"-branded consent screens are wanted instead of "Composio"-branded ones. **No code change required.**
 
 ### 3.13 Phasing & Effort
@@ -381,7 +381,7 @@ This is the **Phase 2 (Integration)** task list. Phase 1 (Structurization) tasks
 | Supabase migration: `user_data_source_connections` + RLS | 1 |
 | `ENABLED_DATA_SOURCES` real list + `DEVICE_DATA_SOURCES` registry wired to `permissionService.ts` | 1 |
 | FastAPI connection endpoints (connect / callback / list / status / disconnect / enabled) + unit tests | 6.5 |
-| Real adapters replacing Phase 1 stubs — third-party: gmail, googlecalendar, googlecontacts (Composio-backed) | 4.5 |
+| Real adapters replacing Phase 1 stubs — third-party: gmail, googlecalendar (Composio-backed) | 4.5 |
 | Real adapters replacing Phase 1 stubs — device: device_calendar, device_contacts, device_otp, device_location. Main agent path uses LangGraph `interrupt()` → RN; consent agent path uses existing on-device fetch flow (same envelope shape, two orchestrations) | 6 |
 | Backend Google cleanup (remove `google_service.py`, `google_api_client.py`, `google_user_profile_service.py`, `token_encryption.py` Google paths, `routes/google.py`) | 4 |
 | `marketplace_composio.py` migration: raw `httpx` → Composio SDK + read from `connected_data_sources` dict | 1.5 |
@@ -413,7 +413,11 @@ Direct OAuth per provider means re-implementing token storage, encryption, refre
 
 ### 4.2 Why is the "Trybo" branding on the OAuth consent screen a dashboard config, not a code change?
 
-Composio decouples OAuth credential configuration from runtime code. The same SDK call (`composio_client.connected_accounts.initiate(user_id, toolkit_slug)`) works whether the toolkit is set to default Composio OAuth or to custom Trybo-registered credentials. Whichever is set in the dashboard for that toolkit is what the user sees. Trybo can ship M1 with default branding and flip to custom branding once Google's app verification is complete — without a code release.
+Composio decouples OAuth credential configuration from runtime code. The runtime "initiate connection" call resolves to the same workspace auth-config record whether that record points at default Composio OAuth or at custom Trybo-registered credentials — the choice is made in the Composio dashboard, not at the call site. Whichever is set there for that toolkit is what the user sees. Trybo can ship M1 with default branding and flip to custom branding once Google's app verification is complete — without a code release.
+
+### 4.3 Where does the per-toolkit auth-config identifier live?
+
+Each toolkit enabled in a Composio workspace gets its own auth-config identifier, generated by Composio at dashboard-setup time. That identifier is workspace-private — committing it would tie the codebase to one specific Composio account. Each enabled toolkit gets one entry in `.env` (which is gitignored), and the runtime reads it at OAuth-initiate time. v1 carries two: one for `gmail`, one for `googlecalendar`. Adding a future toolkit means creating its auth config in the Composio dashboard, copying the new identifier into `.env`, and adding the source slug to the registry. We chose explicit env entries over a startup discovery call against Composio for predictability — one fewer external dependency at boot, configuration that's auditable per deploy.
 
 ### 4.3 Why a thin enabled list instead of a rich static registry?
 
@@ -491,9 +495,9 @@ Custom OAuth — when Trybo's own Google Cloud project requests Gmail read scope
 
 Free tier is 20K calls/month; Starter is $29/month for 200K. Connection initiations are infrequent (one per user per source). Real cost scaling kicks in once Phase 2 ships and agents are fetching from Composio per turn. For the v1 source set (Gmail, Calendar, Contacts) and the current dev cohort, free tier is comfortable. Monitor as user count grows; switch to Starter when needed.
 
-### 4.22 What about multiple Google scopes (Gmail vs Calendar vs Contacts)?
+### 4.22 What about multiple Google scopes (Gmail vs Calendar)?
 
-Each Composio toolkit (`gmail`, `googlecalendar`, `googlecontacts`) is a separate connection with its own scopes. The user connects them individually as the agent needs each. A future "Connect Google" macro that requests all three at once is a UX improvement, not an M1 concern.
+Each Composio toolkit (`gmail`, `googlecalendar`) is a separate connection with its own scopes. The user connects them individually as the agent needs each. A future "Connect Google" macro that requests both at once is a UX improvement, not an M1 concern. Google Contacts is excluded from v1 — the device contact source covers the CONTACTS category for now.
 
 ### 4.23 Where does the unified Information Retrieval Skill come together?
 
